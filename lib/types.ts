@@ -54,3 +54,14 @@ export interface RunEvent {
   message: string;
   data: unknown;
 }
+
+export interface CourseTopic {
+  id: string;
+  course_id: string;
+  parent_id: string | null;
+  level: number;
+  order_index: number;
+  title: string;
+  source_file_ids: string[] | null;
+  created_at: string;
+}

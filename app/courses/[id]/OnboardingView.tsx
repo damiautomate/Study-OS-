@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ensureSession } from "@/lib/supabase/client";
-import type { Course, OnboardingRun, RunEvent, SourceFile } from "@/lib/types";
+import type { Course, OnboardingRun, RunEvent, SourceFile, CourseTopic } from "@/lib/types";
 
 const STATUS_LABEL: Record<string, string> = {
   read: "Read",
@@ -49,6 +49,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const [run, setRun] = useState<OnboardingRun | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [files, setFiles] = useState<SourceFile[]>([]);
+  const [topics, setTopics] = useState<CourseTopic[]>([]);
   const [loaded, setLoaded] = useState(false);
   const feedEnd = useRef<HTMLDivElement>(null);
 
@@ -82,6 +83,10 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         .from("source_files").select("*").eq("run_id", runRow.id).order("created_at", { ascending: true });
       setFiles((fl as SourceFile[]) ?? []);
 
+      const { data: tp } = await supabase
+        .from("course_topics").select("*").eq("course_id", courseId).order("order_index", { ascending: true });
+      setTopics((tp as CourseTopic[]) ?? []);
+
       channel = supabase
         .channel(`run-${runRow.id}`)
         .on("postgres_changes",
@@ -100,6 +105,9 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         .on("postgres_changes",
           { event: "UPDATE", schema: "public", table: "onboarding_runs", filter: `id=eq.${runRow.id}` },
           (p) => setRun(p.new as OnboardingRun))
+        .on("postgres_changes",
+          { event: "INSERT", schema: "public", table: "course_topics", filter: `course_id=eq.${courseId}` },
+          (p) => setTopics((prev) => [...prev, p.new as CourseTopic]))
         .subscribe();
     })();
 
@@ -174,6 +182,32 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
           <div ref={feedEnd} />
         </ol>
       </section>
+
+      {/* course map */}
+      {topics.length > 0 && (
+        <section className="mb-10">
+          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Course map</h2>
+          <ol className="space-y-5">
+            {topics.filter((t) => t.level === 1).map((mod) => (
+              <li key={mod.id} className="rise">
+                <h3 className="text-lg text-paper">{mod.title}</h3>
+                <ul className="mt-2 space-y-1.5 border-l border-line pl-4">
+                  {topics.filter((t) => t.parent_id === mod.id).map((sub) => (
+                    <li key={sub.id} className="flex items-baseline justify-between gap-3 text-sm">
+                      <span className="text-paper/85">{sub.title}</span>
+                      <span className="shrink-0 text-[11px] text-faint">
+                        {sub.source_file_ids && sub.source_file_ids.length > 0
+                          ? `${sub.source_file_ids.length} source${sub.source_file_ids.length > 1 ? "s" : ""}`
+                          : "—"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
 
       {/* inventory */}
       {files.length > 0 && (

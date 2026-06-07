@@ -180,3 +180,34 @@ covers. The inventory rows show a category tag + summary instead of just "read".
 - Deferred to Slice 4+: collapsing near-duplicate slide versions, the single
   ordered **topic spine** for the whole course, and the in-app classification
   correction UI.
+
+---
+
+## Slice 4 — Topic spine (added)
+
+Once every document is understood, the worker runs **one** course-level pass that
+merges all the per-document topics into a single ordered, de-duplicated
+two-level map (modules → topics) — the syllabus spine. This is the answer to
+"what do I actually need to study, and in what order," and it's the first thing
+the study agent will read later.
+
+### Extra setup for Slice 4
+1. **SQL editor:** run `supabase/migrations/0004_slice4_spine.sql` (after 0003).
+2. **Edge Function → Secrets** (optional): `SPINE_MODEL` (defaults to Haiku;
+   `claude-sonnet-4-6` gives a more coherent ordering on big courses).
+3. Redeploy the worker.
+
+### How it works
+- The chain is now `extract → read → ocr → understand → spine → done`.
+- When all per-file work is finished, a single `spine` job is enqueued (exactly
+  once, via an atomic stage flip). It feeds every document's category + topics to
+  the model, which returns an ordered `{modules:[{title, topics:[…]}]}` outline.
+- Topic → source-file links are computed **deterministically** in code (matching
+  titles), not by the model, so no source ids are hallucinated.
+- The course page shows a live **Course map** once it's built; each topic notes
+  how many materials cover it.
+
+### Deferred (later slices)
+- Collapsing near-duplicate slide *versions* (beyond exact duplicates).
+- The **question bank** (Slice 5) and **coverage/gap report + review** (Slice 6),
+  which complete the onboarding subsystem.

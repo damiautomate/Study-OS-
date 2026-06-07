@@ -21,6 +21,7 @@ const WORKER_SECRET = Deno.env.get("WORKER_SECRET")!;
 const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const OCR_MODEL = Deno.env.get("OCR_MODEL") ?? "claude-haiku-4-5-20251001";
 const UNDERSTAND_MODEL = Deno.env.get("UNDERSTAND_MODEL") ?? "claude-haiku-4-5-20251001";
+const SPINE_MODEL = Deno.env.get("SPINE_MODEL") ?? "claude-haiku-4-5-20251001";
 const BUCKET = "course-uploads";
 
 const MAX_FILES = 500;
@@ -108,10 +109,24 @@ async function enqueueUnderstand(runId: string, fileId: string) {
 async function maybeFinalize(runId: string, courseId: string) {
   const { count } = await db.from("onboarding_jobs").select("id", { count: "exact", head: true })
     .eq("run_id", runId).in("status", ["queued", "processing"]);
-  if ((count ?? 0) === 0) {
+  if ((count ?? 0) > 0) return;
+
+  // No jobs left. If the spine hasn't been built yet, build it now — exactly once.
+  const { data: claimed } = await db.from("onboarding_runs")
+    .update({ stage: "spine", updated_at: new Date().toISOString() })
+    .eq("id", runId).not("stage", "in", "(spine,done)").select("id");
+  if (claimed && claimed.length > 0) {
+    await db.from("onboarding_jobs").insert({ run_id: runId, stage: "spine" });
+    await logEvent(runId, "stage", "Building the topic map…");
+    return;
+  }
+
+  // Spine already done and nothing left -> finish.
+  const { data: run } = await db.from("onboarding_runs").select("stage").eq("id", runId).single();
+  if (run?.stage === "spine") {
     await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
     await db.from("courses").update({ status: "onboarded" }).eq("id", courseId);
-    await logEvent(runId, "stage", "Inventory ready");
+    await logEvent(runId, "stage", "Course map ready");
   }
 }
 
@@ -406,6 +421,85 @@ async function doUnderstand(job: any) {
   await maybeFinalize(runId, file.course_id);
 }
 
+// ---------- stage: spine (course-level, runs once) ----------
+async function doSpine(job: any) {
+  const runId = job.run_id;
+  const { data: run } = await db.from("onboarding_runs").select("course_id").eq("id", runId).single();
+  if (!run) { await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id); return; }
+  const courseId = run.course_id;
+
+  // idempotent: if a spine already exists, don't rebuild
+  const { count: existing } = await db.from("course_topics").select("id", { count: "exact", head: true }).eq("course_id", courseId);
+  if ((existing ?? 0) > 0) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await maybeFinalize(runId, courseId);
+    return;
+  }
+
+  const { data: files } = await db.from("source_files")
+    .select("id, original_path, category, topics")
+    .eq("course_id", courseId).in("read_status", ["read", "partial"]);
+  const docs = (files ?? []).filter((f: any) => Array.isArray(f.topics) && f.topics.length > 0);
+
+  if (docs.length === 0) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "info", "No topics found to map");
+    await maybeFinalize(runId, courseId);
+    return;
+  }
+
+  const lines = docs.map((d: any) =>
+    `- [${d.category}] ${d.original_path.split("/").pop()}: ${d.topics.map((t: any) => t.title).join("; ")}`
+  ).join("\n");
+  const prompt =
+    "You are building the topic map (syllabus spine) for one university course, from the topics found across its materials. " +
+    "Merge and de-duplicate them into ONE ordered, two-level outline reflecting how the course is most likely taught (foundational topics first). " +
+    "If a course outline is present, prefer its structure. " +
+    'Return ONLY JSON: {"modules":[{"title":"Module name","topics":["Topic","Topic"]}]} — no prose, no code fences.\n\nMaterials and their topics:\n\n' +
+    lines;
+
+  let parsed: any;
+  try {
+    const { text, usage } = await callClaude(SPINE_MODEL, [{ type: "text", text: prompt }], 4000);
+    await db.from("ai_usage").insert({ run_id: runId, file_id: null, stage: "spine", model: SPINE_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+    parsed = parseUnderstanding(text);
+  } catch (_) { /* fall through to empty */ }
+
+  const modules = Array.isArray(parsed?.modules) ? parsed.modules : [];
+
+  // deterministic topic-title -> source-file mapping (no hallucinated ids)
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+  const fileTopics = docs.map((d: any) => ({ id: d.id, titles: (d.topics || []).map((t: any) => norm(t.title)) }));
+  const filesFor = (title: string) => {
+    const n = norm(title);
+    return fileTopics.filter((ft) => ft.titles.some((t) => t === n || t.includes(n) || n.includes(t))).map((ft) => ft.id);
+  };
+
+  let mi = 0, count = 0;
+  for (const m of modules) {
+    if (!m?.title) continue;
+    const { data: parent } = await db.from("course_topics").insert({
+      course_id: courseId, parent_id: null, level: 1, order_index: mi++, title: String(m.title).slice(0, 200),
+    }).select("id").single();
+    count++;
+    const subs = Array.isArray(m.topics) ? m.topics : [];
+    let ti = 0;
+    for (const s of subs) {
+      const title = typeof s === "string" ? s : (s?.title ?? "");
+      if (!title) continue;
+      await db.from("course_topics").insert({
+        course_id: courseId, parent_id: parent!.id, level: 2, order_index: ti++,
+        title: String(title).slice(0, 200), source_file_ids: filesFor(title),
+      });
+      count++;
+    }
+  }
+
+  await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+  await logEvent(runId, count > 0 ? "success" : "warning", count > 0 ? `Topic map built — ${count} topics` : "Could not build the topic map automatically");
+  await maybeFinalize(runId, courseId);
+}
+
 // ---------- main tick ----------
 async function tick(): Promise<{ worked: boolean }> {
   const { data: job, error } = await db.rpc("claim_onboarding_job");
@@ -417,6 +511,7 @@ async function tick(): Promise<{ worked: boolean }> {
     else if (job.stage === "read") await doRead(job);
     else if (job.stage === "ocr") await doOcr(job);
     else if (job.stage === "understand") await doUnderstand(job);
+    else if (job.stage === "spine") await doSpine(job);
     else await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
   } catch (e) {
     await failJobAndRun(job, job.run_id, (e as Error).message);
