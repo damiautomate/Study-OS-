@@ -1,0 +1,110 @@
+# Study OS — Slice 1: Ingest & Inventory
+
+Create a course, upload a zip of its materials, and a background pipeline
+unzips it, removes duplicates, identifies every file, and reads text from the
+readable ones — streaming live progress to a chat-style feed that ends on a
+clean inventory.
+
+**Stack:** Next.js 15 (Vercel) · Supabase (Postgres, Storage, Edge Functions, Realtime) · no local terminal required.
+
+---
+
+## What's inside
+
+```
+app/                      Next.js UI (home, new course, live onboarding view)
+app/api/courses/          creates the course + run + first job, kicks the worker
+lib/supabase/             browser / server / admin clients
+lib/semester.ts           derives test & exam windows from the start date
+supabase/migrations/      the database schema (run this in the SQL editor)
+supabase/functions/       the onboarding-worker Edge Function
+supabase/config.toml      turns off the JWT check for the worker function
+```
+
+The worker does **one file per beat** and then re-invokes itself, so it never
+trips the Edge Function CPU limit while still moving fast. Cron is only a
+watchdog that restarts a stalled run.
+
+---
+
+## Setup (all via web consoles)
+
+### 1. Repo + Supabase project
+- Create a fresh GitHub repo and upload these files.
+- Create a Supabase project. From **Project Settings → API**, copy the
+  **Project URL**, the **anon** key, and the **service_role** key.
+
+### 2. Turn on what the app needs
+- **Authentication → Providers → Anonymous:** enable it. (Slice 1 signs users in
+  anonymously so row-level security works without a login screen — swap in real
+  auth later; every row is already keyed to a `user_id`.)
+- **Database → Extensions:** enable `pg_cron` and `pg_net`.
+
+### 3. Database
+- Open the **SQL editor**, paste all of
+  `supabase/migrations/0001_slice1_ingest.sql`, and run it.
+  This creates the tables, RLS, the job-claim function, the private
+  `course-uploads` bucket + upload policies, and turns on Realtime.
+
+### 4. The worker function
+- **Edge Functions → Create a function**, name it exactly `onboarding-worker`,
+  and paste `supabase/functions/onboarding-worker/index.ts`.
+- In the function's **settings**, turn **Verify JWT off** (it's gated by a
+  secret instead).
+- **Edge Functions → Secrets**, add:
+  `WORKER_SECRET = <a long random string you invent>`
+  (`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected automatically.)
+- Deploy.
+
+### 5. The watchdog cron
+In the SQL editor (replace the two placeholders):
+
+```sql
+select cron.schedule(
+  'onboarding-worker-watchdog',
+  '30 seconds',
+  $$
+  select net.http_post(
+    url     := 'https://YOUR-PROJECT.supabase.co/functions/v1/onboarding-worker',
+    headers := jsonb_build_object(
+                 'Content-Type', 'application/json',
+                 'x-worker-secret', 'YOUR_WORKER_SECRET'),
+    body    := '{}'::jsonb
+  );
+  $$
+);
+```
+
+### 6. Deploy the web app
+- Import the GitHub repo into **Vercel**.
+- Add environment variables (Vercel → Settings → Environment Variables):
+  ```
+  NEXT_PUBLIC_SUPABASE_URL       = https://YOUR-PROJECT.supabase.co
+  NEXT_PUBLIC_SUPABASE_ANON_KEY  = your-anon-key
+  SUPABASE_SERVICE_ROLE_KEY      = your-service-role-key
+  WORKER_SECRET                  = the same string from step 4
+  ```
+- Deploy. Open the site, add a course, upload a zip, watch it work.
+
+---
+
+## What it does / doesn't do (by design)
+
+**Does:** unzip, dedupe (by content hash), type-detect, page-count, and extract
+text from native-text PDFs and plain-text files; live progress; grouped inventory.
+
+**Doesn't yet (next slices):** OCR / vision for scanned (image) PDFs — those are
+flagged `needs_ocr` rather than failed. Word/PowerPoint full-text, AI document
+understanding, classification, the topic spine, and the question bank all come
+after. No AI calls happen in this slice, so it costs nothing to run.
+
+## Honest notes
+
+- The worker relies on `unpdf` and `@zip.js/zip.js` running under Deno. They're
+  built for serverless/edge, but if a specific import misbehaves on deploy, that
+  function file is the one place to check first.
+- A genuinely huge single PDF could exceed the 2s CPU budget while parsing; if
+  so, that one file is marked `failed` with a note and the run still completes —
+  it never takes the whole run down.
+- Caps: 500 files and 300 MB uncompressed per zip (adjustable at the top of the
+  worker).

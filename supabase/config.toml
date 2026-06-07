@@ -1,0 +1,6 @@
+# Minimal config for the onboarding-worker function.
+# The function authenticates callers with the x-worker-secret header,
+# so the platform JWT check is turned off for it.
+
+[functions.onboarding-worker]
+verify_jwt = false

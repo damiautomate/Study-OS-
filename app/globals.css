@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #0c0c10;
+  --color-surface: #15151b;
+  --color-raised: #1c1c24;
+  --color-line: #2a2a34;
+  --color-paper: #ece4d6;
+  --color-muted: #8d887b;
+  --color-faint: #5c5950;
+  --color-gold: #d6a35c;
+  --color-gold-dim: #9c7a48;
+  --color-sage: #7d9b87;
+  --color-rust: #c2705a;
+
+  --font-display: var(--font-fraunces), Georgia, serif;
+  --font-body: var(--font-hanken), system-ui, sans-serif;
+}
+
+html {
+  background: var(--color-ink);
+  color: var(--color-paper);
+}
+
+body {
+  font-family: var(--font-body);
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(214, 163, 92, 0.06), transparent 55%),
+    var(--color-ink);
+  letter-spacing: 0.01em;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+::selection {
+  background: rgba(214, 163, 92, 0.25);
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: rise 0.4s ease both; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+.pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
