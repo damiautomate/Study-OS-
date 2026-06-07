@@ -1,40 +1,44 @@
 // =============================================================
 // Study OS · onboarding-worker  (Supabase Edge Function, Deno)
 //
-// One bounded unit of work per invocation (keeps CPU under the 2s
-// limit), then self-invokes to process the next — so beats chain
-// back-to-back without waiting on cron. Cron is only a watchdog.
+// Stages:  extract -> read -> ocr -> done
+//   extract : unzip, hash, type, dedupe, store, queue reads
+//   read    : one file — native text, or hand image files to OCR
+//   ocr     : one file/chunk — transcribe via Claude vision (no
+//             rasterization; the API renders the PDF server-side)
 //
-// Stages:
-//   extract -> unzip, hash, type, dedupe, store files, queue reads
-//   read    -> one file: page-count + native text, or flag needs_ocr
+// One bounded unit per invocation (CPU stays under the 2s limit),
+// then self-invokes to chain. Cron is only a watchdog.
 // =============================================================
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { ZipReader, BlobReader, Uint8ArrayWriter } from "npm:@zip.js/zip.js@2.7.45";
 import { getDocumentProxy, extractText } from "npm:unpdf@0.12.1";
+import { PDFDocument } from "npm:pdf-lib@1.17.1";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const WORKER_SECRET = Deno.env.get("WORKER_SECRET")!;
+const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
+const OCR_MODEL = Deno.env.get("OCR_MODEL") ?? "claude-haiku-4-5-20251001";
 const BUCKET = "course-uploads";
 
-// safety caps (extract refuses anything past these)
+// safety / cost caps
 const MAX_FILES = 500;
 const MAX_TOTAL_UNCOMPRESSED = 300 * 1024 * 1024; // 300 MB
 const MAX_ATTEMPTS = 4;
+const OCR_CHUNK_PAGES = 20;        // pages per OCR call (keeps output within token budget)
+const MAX_OCR_PAGES = 200;         // hard cap per document
+const OCR_MAX_TOKENS = 16000;
 
-const db = createClient(SUPABASE_URL, SERVICE_KEY, {
-  auth: { persistSession: false },
-});
+const OCR_PROMPT =
+  "Transcribe all readable text from this document verbatim, preserving reading order. " +
+  "Include text from tables, figures, and handwriting where legible. Output ONLY the transcribed text, no commentary.";
+
+const db = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
 // ---------- helpers ----------
-async function logEvent(
-  runId: string,
-  kind: string,
-  message: string,
-  data?: unknown,
-) {
+async function logEvent(runId: string, kind: string, message: string, data?: unknown) {
   await db.from("run_events").insert({ run_id: runId, kind, message, data: data ?? null });
 }
 
@@ -47,26 +51,34 @@ function detectMime(name: string, bytes: Uint8Array): string {
   const b = bytes;
   if (b.length >= 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return "application/pdf";
   if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) {
-    const lower = name.toLowerCase();
-    if (lower.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-    if (lower.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    const l = name.toLowerCase();
+    if (l.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (l.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
     return "application/zip";
   }
   if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
   if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return "image/png";
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".txt") || lower.endsWith(".md")) return "text/plain";
-  if (lower.endsWith(".csv")) return "text/csv";
+  const l = name.toLowerCase();
+  if (l.endsWith(".txt") || l.endsWith(".md")) return "text/plain";
+  if (l.endsWith(".csv")) return "text/csv";
   return "application/octet-stream";
 }
 
 function isJunk(path: string): boolean {
-  if (path.includes("..") || path.startsWith("/")) return true; // path traversal
-  const parts = path.split("/");
-  const base = parts[parts.length - 1] ?? "";
+  if (path.includes("..") || path.startsWith("/")) return true;
+  const base = path.split("/").pop() ?? "";
   if (path.startsWith("__MACOSX/") || path.includes("/__MACOSX/")) return true;
-  if (base.startsWith(".")) return true; // .DS_Store etc.
+  if (base.startsWith(".")) return true;
   return false;
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
 }
 
 function fireNextTick() {
@@ -86,16 +98,56 @@ function fireNextTick() {
   } catch (_) { /* no-op */ }
 }
 
+async function maybeFinalize(runId: string, courseId: string) {
+  const { count } = await db
+    .from("onboarding_jobs")
+    .select("id", { count: "exact", head: true })
+    .eq("run_id", runId)
+    .in("status", ["queued", "processing"]);
+  if ((count ?? 0) === 0) {
+    await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
+    await db.from("courses").update({ status: "onboarded" }).eq("id", courseId);
+    await logEvent(runId, "stage", "Inventory ready");
+  }
+}
+
 async function failJobAndRun(job: any, runId: string, msg: string) {
   if (job.attempts >= MAX_ATTEMPTS) {
     await db.from("onboarding_jobs").update({ status: "failed" }).eq("id", job.id);
     await db.from("onboarding_runs").update({ status: "failed", error: msg, updated_at: new Date().toISOString() }).eq("id", runId);
     await logEvent(runId, "error", `Stopped: ${msg}`);
   } else {
-    // release for retry
     await db.from("onboarding_jobs").update({ status: "queued", locked_at: null }).eq("id", job.id);
     await logEvent(runId, "warning", `Retrying after error: ${msg}`);
   }
+}
+
+// Calls Claude with a document or image block; returns text + usage.
+async function callClaude(block: Record<string, unknown>): Promise<{ text: string; usage: any }> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OCR_MODEL,
+      max_tokens: OCR_MAX_TOKENS,
+      messages: [{ role: "user", content: [block, { type: "text", text: OCR_PROMPT }] }],
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Claude ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = (data.content ?? [])
+    .filter((c: any) => c.type === "text")
+    .map((c: any) => c.text)
+    .join("")
+    .trim();
+  return { text, usage: data.usage ?? {} };
 }
 
 // ---------- stage: extract ----------
@@ -121,7 +173,7 @@ async function doExtract(job: any) {
 
   await logEvent(runId, "info", `Unzipped — ${files.length} files found`);
 
-  const seen = new Map<string, string>(); // hash -> original_path
+  const seen = new Map<string, string>();
   let dupes = 0;
   let idx = 0;
   const readJobs: { run_id: string; stage: string; file_id: string }[] = [];
@@ -162,7 +214,6 @@ async function doExtract(job: any) {
 
   if (dupes > 0) await logEvent(runId, "info", `${dupes} duplicate ${dupes === 1 ? "file" : "files"} skipped`);
 
-  // queue one read job per real file, advance the run
   if (readJobs.length > 0) await db.from("onboarding_jobs").insert(readJobs);
   await db.from("onboarding_runs").update({ stage: "read", updated_at: new Date().toISOString() }).eq("id", runId);
   await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
@@ -173,13 +224,17 @@ async function doExtract(job: any) {
 async function doRead(job: any) {
   const runId = job.run_id;
   const { data: file } = await db.from("source_files").select("*").eq("id", job.file_id).single();
-  if (!file) { await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id); return; }
-  if (file.read_status !== "pending") { await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id); return; } // idempotent
+  if (!file || file.read_status !== "pending") {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    if (file) await maybeFinalize(runId, file.course_id);
+    return;
+  }
 
-  let status: string = "needs_ocr";
-  let pageCount: number | null = null;
+  let status = "unsupported";
+  let pageCount: number | null = file.page_count;
   let textPath: string | null = null;
   let note: string | null = null;
+  let queueOcr = false;
 
   try {
     const dl = await db.storage.from(BUCKET).download(file.storage_path);
@@ -196,17 +251,22 @@ async function doRead(job: any) {
         await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(text), { contentType: "text/plain", upsert: true });
         status = "read";
       } else {
-        status = "needs_ocr";
-        note = "scanned / image-based PDF — queued for OCR (Slice 2)";
+        status = "needs_ocr"; // scanned/image PDF -> OCR
+        queueOcr = true;
+        note = "scanned PDF — reading with OCR";
       }
+    } else if (file.mime_type?.startsWith("image/")) {
+      status = "needs_ocr";
+      queueOcr = true;
+      note = "image — reading with OCR";
     } else if (file.mime_type === "text/plain" || file.mime_type === "text/csv") {
       const text = new TextDecoder().decode(bytes);
       textPath = `text/${runId}/${file.id}.txt`;
       await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(text), { contentType: "text/plain", upsert: true });
       status = "read";
     } else {
-      status = "needs_ocr";
-      note = "not natively readable yet — Slice 2";
+      status = "unsupported";
+      note = "office/other format — extraction in a later slice";
     }
   } catch (e) {
     status = "failed";
@@ -214,19 +274,100 @@ async function doRead(job: any) {
   }
 
   await db.from("source_files").update({ read_status: status, page_count: pageCount, text_path: textPath, note }).eq("id", file.id);
+  if (queueOcr) await db.from("onboarding_jobs").insert({ run_id: runId, stage: "ocr", file_id: file.id, chunk_index: 0 });
   await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
 
-  // progress + completion check
-  const { count: total } = await db.from("source_files").select("id", { count: "exact", head: true }).eq("run_id", runId).neq("read_status", "duplicate");
-  const { count: pending } = await db.from("source_files").select("id", { count: "exact", head: true }).eq("run_id", runId).eq("read_status", "pending");
-  const done = (total ?? 0) - (pending ?? 0);
   const label = file.original_path.split("/").pop();
-  await logEvent(runId, status === "read" ? "success" : "info", `Read ${done} of ${total}: ${label}`, { status });
+  if (!queueOcr) await logEvent(runId, status === "read" ? "success" : "info", `Read: ${label}`, { status });
 
-  if ((pending ?? 0) === 0) {
-    await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
-    await db.from("courses").update({ status: "onboarded" }).eq("id", file.course_id);
-    await logEvent(runId, "stage", "Inventory ready");
+  await maybeFinalize(runId, file.course_id);
+}
+
+// ---------- stage: ocr (one file or one chunk) ----------
+async function doOcr(job: any) {
+  const runId = job.run_id;
+  const { data: file } = await db.from("source_files").select("*").eq("id", job.file_id).single();
+  if (!file || file.read_status !== "needs_ocr") {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    if (file) await maybeFinalize(runId, file.course_id);
+    return;
+  }
+
+  const label = file.original_path.split("/").pop();
+  const textPath = `text/${runId}/${file.id}.txt`;
+
+  try {
+    const dl = await db.storage.from(BUCKET).download(file.storage_path);
+    if (dl.error || !dl.data) throw new Error("file missing in storage");
+    const bytes = new Uint8Array(await dl.data.arrayBuffer());
+
+    // ----- standalone image: single call -----
+    if (file.mime_type?.startsWith("image/")) {
+      const { text, usage } = await callClaude({
+        type: "image",
+        source: { type: "base64", media_type: file.mime_type, data: toBase64(bytes) },
+      });
+      await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(text), { contentType: "text/plain", upsert: true });
+      await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+      await db.from("source_files").update({ read_status: "read", text_path: textPath }).eq("id", file.id);
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "success", `Read (OCR): ${label}`);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
+
+    // ----- PDF: chunked by pages, sequential beats -----
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const total = src.getPageCount();
+    const cap = Math.min(total, MAX_OCR_PAGES);
+    const idx = job.chunk_index ?? 0;
+    const start = idx * OCR_CHUNK_PAGES;
+    const end = Math.min(start + OCR_CHUNK_PAGES, cap);
+
+    // build a sub-PDF for this page window
+    const out = await PDFDocument.create();
+    const indices = Array.from({ length: end - start }, (_, i) => start + i);
+    const copied = await out.copyPages(src, indices);
+    copied.forEach((p) => out.addPage(p));
+    const chunkBytes = await out.save();
+
+    const { text, usage } = await callClaude({
+      type: "document",
+      source: { type: "base64", media_type: "application/pdf", data: toBase64(new Uint8Array(chunkBytes)) },
+    });
+    await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+
+    // append this chunk's text in order (beats for one file are sequential)
+    let prior = "";
+    if (idx > 0) {
+      const ex = await db.storage.from(BUCKET).download(textPath);
+      if (!ex.error && ex.data) prior = await ex.data.text();
+    }
+    const merged = idx > 0 ? `${prior}\n\n${text}` : text;
+    await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(merged), { contentType: "text/plain", upsert: true });
+
+    if (end >= cap) {
+      const final = cap < total ? "partial" : "read";
+      await db.from("source_files").update({
+        read_status: final,
+        page_count: total,
+        text_path: textPath,
+        note: cap < total ? `OCR limited to first ${cap} of ${total} pages` : null,
+      }).eq("id", file.id);
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "success", `Read (OCR): ${label}${cap < total ? " (partial)" : ""}`);
+      await maybeFinalize(runId, file.course_id);
+    } else {
+      // queue the next chunk, finish this beat
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "ocr", file_id: file.id, chunk_index: idx + 1 });
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "info", `Reading scanned pages ${start + 1}–${end} of ${cap}: ${label}`);
+    }
+  } catch (e) {
+    await db.from("source_files").update({ read_status: "ocr_failed", note: `OCR error: ${(e as Error).message}`.slice(0, 300) }).eq("id", file.id);
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "warning", `Could not OCR: ${label}`);
+    await maybeFinalize(runId, file.course_id);
   }
 }
 
@@ -239,6 +380,7 @@ async function tick(): Promise<{ worked: boolean }> {
   try {
     if (job.stage === "extract") await doExtract(job);
     else if (job.stage === "read") await doRead(job);
+    else if (job.stage === "ocr") await doOcr(job);
     else await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
   } catch (e) {
     await failJobAndRun(job, job.run_id, (e as Error).message);
@@ -251,6 +393,6 @@ Deno.serve(async (req) => {
     return new Response("forbidden", { status: 403 });
   }
   const { worked } = await tick();
-  if (worked) fireNextTick(); // chain to the next unit immediately
+  if (worked) fireNextTick();
   return new Response(JSON.stringify({ worked }), { headers: { "Content-Type": "application/json" } });
 });

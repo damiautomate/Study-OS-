@@ -108,3 +108,38 @@ after. No AI calls happen in this slice, so it costs nothing to run.
   it never takes the whole run down.
 - Caps: 500 files and 300 MB uncompressed per zip (adjustable at the top of the
   worker).
+
+---
+
+## Slice 2 — OCR (added)
+
+Image-based files (scanned PDFs, photos) are now read into text with Claude
+vision. No rasterization happens in the function — the Anthropic API renders PDF
+pages server-side — so this rides on the same worker with one new `ocr` stage.
+
+### Extra setup for Slice 2
+1. **SQL editor:** run `supabase/migrations/0002_slice2_ocr.sql` (after 0001).
+2. **Edge Function → Secrets**, add:
+   ```
+   ANTHROPIC_API_KEY = your-central-anthropic-key
+   OCR_MODEL         = claude-haiku-4-5-20251001   # optional; this is the default
+   ```
+3. Redeploy the `onboarding-worker` function (paste the updated `index.ts`).
+
+### Switching the OCR model
+`OCR_MODEL` is just an env var — change it and redeploy, no code edits:
+- `claude-haiku-4-5-20251001` — cheapest, fast, default. Best for most scans.
+- `claude-sonnet-4-6` — step up for messy handwriting / poor scans.
+- `claude-opus-4-8` — highest quality, highest cost; rarely needed for OCR.
+
+### Cost & limits
+- One AI call per image, and per 20-page chunk of a scanned PDF.
+- OCR is capped at 200 pages per document (`MAX_OCR_PAGES` in the worker);
+  beyond that a file is marked **partial**.
+- Every call is logged to `ai_usage` (tokens per file) so a course's cost is visible.
+- Word/PowerPoint are **not** OCR cases — they stay flagged `unsupported` for a
+  later slice (they need office parsing, not vision).
+
+### New inventory outcomes
+`read` · `partial` (page cap hit) · `ocr_failed` · `unsupported` · plus the
+Slice 1 ones. A run finishes when no jobs remain — which now covers OCR too.

@@ -7,7 +7,10 @@ import type { Course, OnboardingRun, RunEvent, SourceFile } from "@/lib/types";
 
 const STATUS_LABEL: Record<string, string> = {
   read: "Read",
-  needs_ocr: "Needs OCR",
+  needs_ocr: "Reading scans",
+  partial: "Partly read",
+  ocr_failed: "OCR failed",
+  unsupported: "Unsupported",
   failed: "Unreadable",
   duplicate: "Duplicates",
   pending: "Waiting",
@@ -15,6 +18,9 @@ const STATUS_LABEL: Record<string, string> = {
 const STATUS_TONE: Record<string, string> = {
   read: "text-sage",
   needs_ocr: "text-gold",
+  partial: "text-gold",
+  ocr_failed: "text-rust",
+  unsupported: "text-faint",
   failed: "text-rust",
   duplicate: "text-faint",
   pending: "text-muted",
@@ -94,7 +100,8 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   }, [events]);
 
   const real = files.filter((f) => f.read_status !== "duplicate");
-  const processed = real.filter((f) => f.read_status !== "pending").length;
+  const inFlight = new Set(["pending", "needs_ocr"]);
+  const processed = real.filter((f) => !inFlight.has(f.read_status)).length;
   const total = real.length;
   const pct = total ? Math.round((processed / total) * 100) : 0;
   const isDone = run?.status === "done";
@@ -102,7 +109,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
 
   const groups: Record<string, SourceFile[]> = {};
   for (const f of files) (groups[f.read_status] ??= []).push(f);
-  const order = ["read", "needs_ocr", "failed", "duplicate", "pending"];
+  const order = ["read", "partial", "needs_ocr", "ocr_failed", "unsupported", "failed", "duplicate", "pending"];
 
   if (loaded && !run) {
     return (
