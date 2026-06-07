@@ -111,8 +111,16 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
           { event: "UPDATE", schema: "public", table: "onboarding_runs", filter: `id=eq.${runRow.id}` },
           (p) => setRun(p.new as OnboardingRun))
         .on("postgres_changes",
-          { event: "INSERT", schema: "public", table: "course_topics", filter: `course_id=eq.${courseId}` },
-          (p) => setTopics((prev) => [...prev, p.new as CourseTopic]))
+          { event: "*", schema: "public", table: "course_topics", filter: `course_id=eq.${courseId}` },
+          (p) => {
+            const row = p.new as CourseTopic;
+            if (!row?.id) return;
+            setTopics((prev) => {
+              const i = prev.findIndex((t) => t.id === row.id);
+              if (i === -1) return [...prev, row];
+              const next = [...prev]; next[i] = row; return next;
+            });
+          })
         .on("postgres_changes",
           { event: "INSERT", schema: "public", table: "questions", filter: `course_id=eq.${courseId}` },
           (p) => setQuestions((prev) => [...prev, p.new as Question]))
@@ -142,6 +150,18 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const topicsWithQ = new Set(questions.map((q) => q.topic_id).filter(Boolean)).size;
   const withSolution = questions.filter((q) => q.has_solution).length;
 
+  const l2 = topics.filter((t) => t.level === 2);
+  const topicsNoReading = l2.filter((t) => t.source_count === 0);
+  const topicsNoQuestions = l2.filter((t) => t.question_count === 0);
+  const unreadableCount = files.filter((f) => ["failed", "ocr_failed", "unsupported"].includes(f.read_status)).length;
+  const untaggedCount = questions.filter((q) => !q.topic_id).length;
+
+  async function confirmOnboarding() {
+    const supabase = await ensureSession();
+    await supabase.from("courses").update({ status: "onboarded" }).eq("id", courseId);
+    setCourse((c) => (c ? { ...c, status: "onboarded" } : c));
+  }
+
   if (loaded && !run) {
     return (
       <main className="mx-auto max-w-2xl px-5 py-16">
@@ -159,6 +179,21 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         <h1 className="text-3xl sm:text-4xl text-paper">{course?.title ?? "Course"}</h1>
         {course?.code && <p className="text-sm text-faint mt-1">{course.code}</p>}
       </header>
+
+      {isDone && course?.status === "review" && (
+        <div className="mb-8 rounded-xl border border-gold/30 bg-gold/5 p-5 rise">
+          <p className="text-sm text-paper">Onboarding complete. Review the map, question bank, and gaps below — then confirm.</p>
+          <button
+            onClick={confirmOnboarding}
+            className="mt-3 rounded-full bg-gold px-5 py-2 text-sm font-medium text-ink transition hover:bg-paper"
+          >
+            Looks right — finish onboarding
+          </button>
+        </div>
+      )}
+      {course?.status === "onboarded" && (
+        <p className="mb-8 text-sm text-sage">✓ Onboarded</p>
+      )}
 
       {/* progress */}
       <div className="mb-8">
@@ -243,6 +278,27 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         </section>
       )}
 
+      {/* coverage */}
+      {isDone && l2.length > 0 && (
+        <section className="mb-10">
+          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Coverage & gaps</h2>
+          <div className="space-y-3">
+            <GapRow tone={topicsNoReading.length ? "warn" : "ok"}
+              label="Topics with no reading material"
+              count={topicsNoReading.length}
+              items={topicsNoReading.map((t) => t.title)} />
+            <GapRow tone={topicsNoQuestions.length ? "warn" : "ok"}
+              label="Topics with no practice questions"
+              count={topicsNoQuestions.length}
+              items={topicsNoQuestions.map((t) => t.title)} />
+            <GapRow tone={untaggedCount ? "info" : "ok"}
+              label="Questions not matched to a topic" count={untaggedCount} />
+            <GapRow tone={unreadableCount ? "info" : "ok"}
+              label="Files that couldn't be read" count={unreadableCount} />
+          </div>
+        </section>
+      )}
+
       {/* inventory */}
       {files.length > 0 && (
         <section>
@@ -285,5 +341,25 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         </section>
       )}
     </main>
+  );
+}
+
+function GapRow({ label, count, items, tone }: { label: string; count: number; items?: string[]; tone: "ok" | "warn" | "info" }) {
+  const dot = tone === "warn" ? "bg-gold" : tone === "info" ? "bg-muted" : "bg-sage";
+  return (
+    <div className="rounded-lg border border-line bg-surface px-4 py-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
+          <span className="text-sm text-paper/90">{label}</span>
+        </div>
+        <span className="text-sm tabular-nums text-faint">{count}</span>
+      </div>
+      {items && count > 0 && (
+        <p className="mt-1.5 pl-3.5 text-xs leading-snug text-muted">
+          {items.slice(0, 12).join(" · ")}{items.length > 12 ? " …" : ""}
+        </p>
+      )}
+    </div>
   );
 }

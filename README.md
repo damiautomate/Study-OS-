@@ -243,3 +243,33 @@ solution is shown. This is the raw material that later makes practice concrete.
 - Remaining to finish onboarding: **Slice 6 — coverage & review** (gap report:
   topics with no materials, topics with no questions, unreadable files; plus the
   final confirmation).
+
+---
+
+## Slice 6 — Coverage & review (added) · onboarding complete
+
+The final onboarding step. After the question bank, a deterministic `coverage`
+pass (no AI) computes, per topic, how many materials and questions cover it, and
+surfaces the honest gaps. Onboarding then hands off to **you** for confirmation
+rather than auto-completing.
+
+### Extra setup for Slice 6
+1. **SQL editor:** run `supabase/migrations/0006_slice6_coverage.sql` (after 0005).
+2. Redeploy the worker. (No new secrets.)
+
+### How it works
+- Full chain: `extract → read → ocr → understand → spine → questions → coverage → done`.
+- `coverage` fills each topic's `source_count` / `question_count` and logs a summary.
+- On finish the course moves to **`review`** (not straight to `onboarded`). The
+  course page shows a **Coverage & gaps** panel — topics with no readings, topics
+  with no questions, untagged questions, unreadable files — and a **"Looks right —
+  finish onboarding"** button that flips the course to `onboarded`. That's the
+  human-in-the-loop gate from the original workflow.
+
+### Onboarding subsystem is now complete
+A course goes from a messy zip to: a clean inventory, every file read (incl. OCR),
+each document understood & classified, one ordered topic spine, a topic-tagged
+question bank, and an honest coverage report — confirmed by you.
+
+**This is the point to run one real course end-to-end before the agent layer
+(student model, heartbeat, phases 2–8) gets built on top of it.**

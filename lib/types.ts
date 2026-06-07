@@ -63,6 +63,8 @@ export interface CourseTopic {
   order_index: number;
   title: string;
   source_file_ids: string[] | null;
+  source_count: number;
+  question_count: number;
   created_at: string;
 }
 

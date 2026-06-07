@@ -109,11 +109,11 @@ async function enqueueUnderstand(runId: string, fileId: string) {
 
 async function finishRun(runId: string, courseId: string) {
   await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
-  await db.from("courses").update({ status: "onboarded" }).eq("id", courseId);
-  await logEvent(runId, "stage", "Course ready");
+  await db.from("courses").update({ status: "review" }).eq("id", courseId);
+  await logEvent(runId, "stage", "Ready for your review");
 }
 
-// Drives the phase machine: …read/understand → spine → questions → done.
+// Drives the phase machine: read/understand → spine → questions → coverage → done.
 async function maybeFinalize(runId: string, courseId: string) {
   const { count } = await db.from("onboarding_jobs").select("id", { count: "exact", head: true })
     .eq("run_id", runId).in("status", ["queued", "processing"]);
@@ -124,7 +124,7 @@ async function maybeFinalize(runId: string, courseId: string) {
   if (!stage || stage === "done") return;
 
   // (1) reading/understanding done -> build the spine
-  if (stage !== "spine" && stage !== "questions") {
+  if (stage !== "spine" && stage !== "questions" && stage !== "coverage") {
     const { data: won } = await db.from("onboarding_runs")
       .update({ stage: "spine", updated_at: new Date().toISOString() })
       .eq("id", runId).eq("stage", stage).select("id");
@@ -135,7 +135,7 @@ async function maybeFinalize(runId: string, courseId: string) {
     return;
   }
 
-  // (2) spine done -> extract questions from question-bearing documents
+  // (2) spine done -> extract questions
   if (stage === "spine") {
     const { data: won } = await db.from("onboarding_runs")
       .update({ stage: "questions", updated_at: new Date().toISOString() })
@@ -147,14 +147,26 @@ async function maybeFinalize(runId: string, courseId: string) {
         await db.from("onboarding_jobs").insert(qdocs.map((d: any) => ({ run_id: runId, stage: "questions", file_id: d.id })));
         await logEvent(runId, "stage", `Finding past questions in ${qdocs.length} ${qdocs.length === 1 ? "document" : "documents"}…`);
       } else {
-        await finishRun(runId, courseId);
+        await maybeFinalize(runId, courseId); // nothing to do; advance to coverage
       }
     }
     return;
   }
 
-  // (3) questions done -> finish
+  // (3) questions done -> coverage report
   if (stage === "questions") {
+    const { data: won } = await db.from("onboarding_runs")
+      .update({ stage: "coverage", updated_at: new Date().toISOString() })
+      .eq("id", runId).eq("stage", "questions").select("id");
+    if (won && won.length > 0) {
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "coverage" });
+      await logEvent(runId, "stage", "Checking coverage…");
+    }
+    return;
+  }
+
+  // (4) coverage done -> hand to review
+  if (stage === "coverage") {
     await finishRun(runId, courseId);
   }
 }
@@ -614,6 +626,38 @@ async function doQuestions(job: any) {
   await maybeFinalize(runId, courseId);
 }
 
+// ---------- stage: coverage (course-level, deterministic) ----------
+async function doCoverage(job: any) {
+  const runId = job.run_id;
+  const { data: run } = await db.from("onboarding_runs").select("course_id").eq("id", runId).single();
+  if (!run) { await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id); return; }
+  const courseId = run.course_id;
+
+  const { data: topics } = await db.from("course_topics").select("id, source_file_ids").eq("course_id", courseId).eq("level", 2);
+  const { data: qs } = await db.from("questions").select("topic_id").eq("course_id", courseId);
+
+  const qCount = new Map<string, number>();
+  for (const q of qs ?? []) if (q.topic_id) qCount.set(q.topic_id, (qCount.get(q.topic_id) ?? 0) + 1);
+
+  let noReading = 0, noQuestions = 0;
+  for (const t of topics ?? []) {
+    const sc = Array.isArray(t.source_file_ids) ? t.source_file_ids.length : 0;
+    const qc = qCount.get(t.id) ?? 0;
+    await db.from("course_topics").update({ source_count: sc, question_count: qc }).eq("id", t.id);
+    if (sc === 0) noReading++;
+    if (qc === 0) noQuestions++;
+  }
+
+  const { count: untagged } = await db.from("questions").select("id", { count: "exact", head: true }).eq("course_id", courseId).is("topic_id", null);
+  const { count: unreadable } = await db.from("source_files").select("id", { count: "exact", head: true }).eq("course_id", courseId).in("read_status", ["failed", "ocr_failed", "unsupported"]);
+
+  await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+  await logEvent(runId, "info",
+    `Coverage — ${(topics ?? []).length} topics · ${noReading} without readings · ${noQuestions} without questions · ${untagged ?? 0} untagged questions · ${unreadable ?? 0} unreadable files`,
+    { noReading, noQuestions, untagged, unreadable });
+  await maybeFinalize(runId, courseId);
+}
+
 // ---------- main tick ----------
 async function tick(): Promise<{ worked: boolean }> {
   const { data: job, error } = await db.rpc("claim_onboarding_job");
@@ -627,6 +671,7 @@ async function tick(): Promise<{ worked: boolean }> {
     else if (job.stage === "understand") await doUnderstand(job);
     else if (job.stage === "spine") await doSpine(job);
     else if (job.stage === "questions") await doQuestions(job);
+    else if (job.stage === "coverage") await doCoverage(job);
     else await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
   } catch (e) {
     await failJobAndRun(job, job.run_id, (e as Error).message);
