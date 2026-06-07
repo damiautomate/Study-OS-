@@ -143,3 +143,40 @@ pages server-side — so this rides on the same worker with one new `ocr` stage.
 ### New inventory outcomes
 `read` · `partial` (page cap hit) · `ocr_failed` · `unsupported` · plus the
 Slice 1 ones. A run finishes when no jobs remain — which now covers OCR too.
+
+---
+
+## Slice 3 — Understanding & classification (added)
+
+Every readable document now gets one structured AI pass that works out **what it
+is**, summarises it, flags whether it holds questions, and lists the topics it
+covers. The inventory rows show a category tag + summary instead of just "read".
+
+### Extra setup for Slice 3
+1. **SQL editor:** run `supabase/migrations/0003_slice3_understanding.sql` (after 0002).
+2. **Edge Function → Secrets** (optional — defaults to Haiku):
+   ```
+   UNDERSTAND_MODEL = claude-haiku-4-5-20251001
+   ```
+   Same options as OCR (`claude-sonnet-4-6` for sharper categorisation).
+3. Redeploy the `onboarding-worker` function.
+
+### How it works
+- The chain is now `extract → read → ocr → understand → done`.
+- When a file becomes readable, an `understand` job is queued. It feeds the text
+  to the model, which returns strict JSON: `category` (slides / textbook / notes
+  / assignment / test / exam / solutions / outline / other), `category_confidence`,
+  `summary`, `contains_questions`, `topics`. The JSON is **validated** before it's
+  stored — bad output is retried once, then falls back to `other` and is flagged.
+- Low-confidence classifications show a small **"check this"** marker in the UI
+  (correcting them in-app is a planned fast-follow).
+- Each call is logged to `ai_usage` with `stage = understand`, separate from OCR.
+- Input is capped at ~120k characters/document; very large texts are summarised
+  from their first portion (noted).
+
+### Honest notes
+- Topics are grounded to the **document**, not to page numbers — our stored text
+  is page-merged. Page-level citations need page-segmented text, a later refinement.
+- Deferred to Slice 4+: collapsing near-duplicate slide versions, the single
+  ordered **topic spine** for the whole course, and the in-app classification
+  correction UI.

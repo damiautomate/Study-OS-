@@ -32,6 +32,17 @@ const EVENT_TONE: Record<string, string> = {
   stage: "text-paper",
   info: "text-muted",
 };
+const CATEGORY_LABEL: Record<string, string> = {
+  slides: "Lecture slides",
+  textbook: "Textbook",
+  notes: "Notes",
+  assignment: "Assignment",
+  test: "Test",
+  exam: "Exam",
+  solutions: "Solutions",
+  outline: "Course outline",
+  other: "Other",
+};
 
 export default function OnboardingView({ courseId }: { courseId: string }) {
   const [course, setCourse] = useState<Course | null>(null);
@@ -175,14 +186,28 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
                   <span className={`text-sm font-medium ${STATUS_TONE[k]}`}>{STATUS_LABEL[k]}</span>
                   <span className="text-xs text-faint">({groups[k].length})</span>
                 </div>
-                <ul className="space-y-1.5">
+                <ul className="space-y-2">
                   {groups[k].map((f) => (
-                    <li key={f.id} className="flex items-baseline justify-between gap-3 text-sm">
-                      <span className="truncate text-paper/90">{f.original_path.split("/").pop()}</span>
-                      <span className="shrink-0 text-[11px] text-faint">
-                        {f.page_count ? `${f.page_count}p` : ""}
-                        {f.note && k !== "read" ? ` · ${f.note}` : ""}
-                      </span>
+                    <li key={f.id} className="rounded-lg border border-line/60 bg-raised/40 px-3 py-2">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <span className="truncate text-sm text-paper/90">{f.original_path.split("/").pop()}</span>
+                        <span className="shrink-0 text-[11px] text-faint">
+                          {f.page_count ? `${f.page_count}p` : ""}
+                          {f.note && k !== "read" ? ` · ${f.note}` : ""}
+                        </span>
+                      </div>
+                      {f.category && (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                          <span className="rounded bg-gold/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-gold-dim">
+                            {CATEGORY_LABEL[f.category] ?? f.category}
+                          </span>
+                          {f.contains_questions && <span className="text-[10px] text-sage">has questions</span>}
+                          {typeof f.category_confidence === "number" && f.category_confidence > 0 && f.category_confidence < 0.6 && (
+                            <span className="text-[10px] text-gold">check this</span>
+                          )}
+                        </div>
+                      )}
+                      {f.summary && <p className="mt-1 text-xs leading-snug text-muted">{f.summary}</p>}
                     </li>
                   ))}
                 </ul>

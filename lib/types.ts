@@ -38,6 +38,11 @@ export interface SourceFile {
   read_status: FileReadStatus;
   text_path: string | null;
   note: string | null;
+  category: string | null;
+  category_confidence: number | null;
+  summary: string | null;
+  contains_questions: boolean | null;
+  topics: { title: string }[] | null;
   created_at: string;
 }
 
