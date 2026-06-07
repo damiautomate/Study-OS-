@@ -22,6 +22,7 @@ const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
 const OCR_MODEL = Deno.env.get("OCR_MODEL") ?? "claude-haiku-4-5-20251001";
 const UNDERSTAND_MODEL = Deno.env.get("UNDERSTAND_MODEL") ?? "claude-haiku-4-5-20251001";
 const SPINE_MODEL = Deno.env.get("SPINE_MODEL") ?? "claude-haiku-4-5-20251001";
+const QUESTIONS_MODEL = Deno.env.get("QUESTIONS_MODEL") ?? "claude-haiku-4-5-20251001";
 const BUCKET = "course-uploads";
 
 const MAX_FILES = 500;
@@ -106,27 +107,55 @@ async function enqueueUnderstand(runId: string, fileId: string) {
   await db.from("onboarding_jobs").insert({ run_id: runId, stage: "understand", file_id: fileId });
 }
 
+async function finishRun(runId: string, courseId: string) {
+  await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
+  await db.from("courses").update({ status: "onboarded" }).eq("id", courseId);
+  await logEvent(runId, "stage", "Course ready");
+}
+
+// Drives the phase machine: …read/understand → spine → questions → done.
 async function maybeFinalize(runId: string, courseId: string) {
   const { count } = await db.from("onboarding_jobs").select("id", { count: "exact", head: true })
     .eq("run_id", runId).in("status", ["queued", "processing"]);
   if ((count ?? 0) > 0) return;
 
-  // No jobs left. If the spine hasn't been built yet, build it now — exactly once.
-  const { data: claimed } = await db.from("onboarding_runs")
-    .update({ stage: "spine", updated_at: new Date().toISOString() })
-    .eq("id", runId).not("stage", "in", "(spine,done)").select("id");
-  if (claimed && claimed.length > 0) {
-    await db.from("onboarding_jobs").insert({ run_id: runId, stage: "spine" });
-    await logEvent(runId, "stage", "Building the topic map…");
+  const { data: run } = await db.from("onboarding_runs").select("stage").eq("id", runId).single();
+  const stage = run?.stage as string | undefined;
+  if (!stage || stage === "done") return;
+
+  // (1) reading/understanding done -> build the spine
+  if (stage !== "spine" && stage !== "questions") {
+    const { data: won } = await db.from("onboarding_runs")
+      .update({ stage: "spine", updated_at: new Date().toISOString() })
+      .eq("id", runId).eq("stage", stage).select("id");
+    if (won && won.length > 0) {
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "spine" });
+      await logEvent(runId, "stage", "Building the topic map…");
+    }
     return;
   }
 
-  // Spine already done and nothing left -> finish.
-  const { data: run } = await db.from("onboarding_runs").select("stage").eq("id", runId).single();
-  if (run?.stage === "spine") {
-    await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
-    await db.from("courses").update({ status: "onboarded" }).eq("id", courseId);
-    await logEvent(runId, "stage", "Course map ready");
+  // (2) spine done -> extract questions from question-bearing documents
+  if (stage === "spine") {
+    const { data: won } = await db.from("onboarding_runs")
+      .update({ stage: "questions", updated_at: new Date().toISOString() })
+      .eq("id", runId).eq("stage", "spine").select("id");
+    if (won && won.length > 0) {
+      const { data: qdocs } = await db.from("source_files")
+        .select("id").eq("course_id", courseId).in("read_status", ["read", "partial"]).eq("contains_questions", true);
+      if (qdocs && qdocs.length > 0) {
+        await db.from("onboarding_jobs").insert(qdocs.map((d: any) => ({ run_id: runId, stage: "questions", file_id: d.id })));
+        await logEvent(runId, "stage", `Finding past questions in ${qdocs.length} ${qdocs.length === 1 ? "document" : "documents"}…`);
+      } else {
+        await finishRun(runId, courseId);
+      }
+    }
+    return;
+  }
+
+  // (3) questions done -> finish
+  if (stage === "questions") {
+    await finishRun(runId, courseId);
   }
 }
 
@@ -500,6 +529,91 @@ async function doSpine(job: any) {
   await maybeFinalize(runId, courseId);
 }
 
+// ---------- stage: questions (one question-bearing document) ----------
+const Q_TYPES = ["mcq", "short", "essay", "numerical", "proof", "other"];
+const Q_DIFF = ["easy", "medium", "hard"];
+
+async function doQuestions(job: any) {
+  const runId = job.run_id;
+  const { data: file } = await db.from("source_files").select("*").eq("id", job.file_id).single();
+  if (!file || !file.text_path) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    if (file) await maybeFinalize(runId, file.course_id);
+    return;
+  }
+  const courseId = file.course_id;
+  const label = file.original_path.split("/").pop();
+
+  // idempotent: skip if this file already produced questions
+  const { count: already } = await db.from("questions").select("id", { count: "exact", head: true }).eq("source_file_id", file.id);
+  if ((already ?? 0) > 0) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await maybeFinalize(runId, courseId);
+    return;
+  }
+
+  try {
+    const dl = await db.storage.from(BUCKET).download(file.text_path);
+    if (dl.error || !dl.data) throw new Error("text missing");
+    let text = await dl.data.text();
+    if (text.length > 100000) text = text.slice(0, 100000);
+
+    const { data: topicRows } = await db.from("course_topics").select("id, title").eq("course_id", courseId).eq("level", 2);
+    const topics = (topicRows ?? []) as { id: string; title: string }[];
+    const topicList = topics.map((t) => t.title);
+
+    const prompt =
+      "You are extracting practice questions from one document in a university course. " +
+      "Identify each distinct question or problem posed to the student. " +
+      'Return ONLY JSON: {"questions":[{"text":"the full question","type":"mcq|short|essay|numerical|proof|other","difficulty":"easy|medium|hard","topic":"best-matching topic from the list, or null","has_solution":true|false}]}. ' +
+      "Set has_solution true only if the answer/solution is shown in THIS document. " +
+      "Choose topic ONLY from this list (or null if none fits): " + JSON.stringify(topicList) +
+      ". If the document has no questions, return {\"questions\":[]}.\n\nDocument text:\n\n" + text;
+
+    let parsed: any;
+    for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
+      const { text: out, usage } = await callClaude(QUESTIONS_MODEL, [{ type: "text", text: prompt }], 8000);
+      await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "questions", model: QUESTIONS_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+      parsed = parseUnderstanding(out);
+    }
+
+    const list = Array.isArray(parsed?.questions) ? parsed.questions.slice(0, 200) : [];
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+    const topicByNorm = new Map(topics.map((t) => [norm(t.title), t.id]));
+
+    const rows = [];
+    for (const q of list) {
+      const qtext = typeof q?.text === "string" ? q.text.trim() : "";
+      if (!qtext) continue;
+      let topicId: string | null = null;
+      if (q?.topic && typeof q.topic === "string") {
+        const n = norm(q.topic);
+        topicId = topicByNorm.get(n) ?? null;
+        if (!topicId) {
+          for (const [tn, id] of topicByNorm) { if (tn.includes(n) || n.includes(tn)) { topicId = id; break; } }
+        }
+      }
+      rows.push({
+        course_id: courseId,
+        source_file_id: file.id,
+        topic_id: topicId,
+        question_text: qtext.slice(0, 4000),
+        q_type: Q_TYPES.includes(q?.type) ? q.type : "other",
+        difficulty: Q_DIFF.includes(q?.difficulty) ? q.difficulty : null,
+        has_solution: !!q?.has_solution,
+      });
+    }
+
+    if (rows.length > 0) await db.from("questions").insert(rows);
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "success", `Found ${rows.length} question${rows.length === 1 ? "" : "s"}: ${label}`);
+  } catch (e) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "warning", `Could not extract questions: ${label}`);
+  }
+  await maybeFinalize(runId, courseId);
+}
+
 // ---------- main tick ----------
 async function tick(): Promise<{ worked: boolean }> {
   const { data: job, error } = await db.rpc("claim_onboarding_job");
@@ -512,6 +626,7 @@ async function tick(): Promise<{ worked: boolean }> {
     else if (job.stage === "ocr") await doOcr(job);
     else if (job.stage === "understand") await doUnderstand(job);
     else if (job.stage === "spine") await doSpine(job);
+    else if (job.stage === "questions") await doQuestions(job);
     else await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
   } catch (e) {
     await failJobAndRun(job, job.run_id, (e as Error).message);

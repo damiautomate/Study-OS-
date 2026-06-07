@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ensureSession } from "@/lib/supabase/client";
-import type { Course, OnboardingRun, RunEvent, SourceFile, CourseTopic } from "@/lib/types";
+import type { Course, OnboardingRun, RunEvent, SourceFile, CourseTopic, Question } from "@/lib/types";
 
 const STATUS_LABEL: Record<string, string> = {
   read: "Read",
@@ -50,6 +50,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [files, setFiles] = useState<SourceFile[]>([]);
   const [topics, setTopics] = useState<CourseTopic[]>([]);
+  const [questions, setQuestions] = useState<Question[]>([]);
   const [loaded, setLoaded] = useState(false);
   const feedEnd = useRef<HTMLDivElement>(null);
 
@@ -87,6 +88,10 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         .from("course_topics").select("*").eq("course_id", courseId).order("order_index", { ascending: true });
       setTopics((tp as CourseTopic[]) ?? []);
 
+      const { data: qs } = await supabase
+        .from("questions").select("*").eq("course_id", courseId);
+      setQuestions((qs as Question[]) ?? []);
+
       channel = supabase
         .channel(`run-${runRow.id}`)
         .on("postgres_changes",
@@ -108,6 +113,9 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         .on("postgres_changes",
           { event: "INSERT", schema: "public", table: "course_topics", filter: `course_id=eq.${courseId}` },
           (p) => setTopics((prev) => [...prev, p.new as CourseTopic]))
+        .on("postgres_changes",
+          { event: "INSERT", schema: "public", table: "questions", filter: `course_id=eq.${courseId}` },
+          (p) => setQuestions((prev) => [...prev, p.new as Question]))
         .subscribe();
     })();
 
@@ -129,6 +137,10 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const groups: Record<string, SourceFile[]> = {};
   for (const f of files) (groups[f.read_status] ??= []).push(f);
   const order = ["read", "partial", "needs_ocr", "ocr_failed", "unsupported", "failed", "duplicate", "pending"];
+
+  const qByType = questions.reduce<Record<string, number>>((a, q) => { const k = q.q_type || "other"; a[k] = (a[k] || 0) + 1; return a; }, {});
+  const topicsWithQ = new Set(questions.map((q) => q.topic_id).filter(Boolean)).size;
+  const withSolution = questions.filter((q) => q.has_solution).length;
 
   if (loaded && !run) {
     return (
@@ -206,6 +218,28 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
               </li>
             ))}
           </ol>
+        </section>
+      )}
+
+      {/* question bank */}
+      {questions.length > 0 && (
+        <section className="mb-10">
+          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Question bank</h2>
+          <div className="rounded-xl border border-line bg-surface p-5">
+            <div className="flex items-baseline gap-2">
+              <span className="font-display text-3xl text-gold">{questions.length}</span>
+              <span className="text-sm text-muted">
+                question{questions.length === 1 ? "" : "s"} · {topicsWithQ} topic{topicsWithQ === 1 ? "" : "s"} covered · {withSolution} with solutions
+              </span>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {Object.entries(qByType).sort((a, b) => b[1] - a[1]).map(([t, n]) => (
+                <span key={t} className="rounded bg-raised px-2 py-0.5 text-[11px] text-paper/80">
+                  {t} · {n}
+                </span>
+              ))}
+            </div>
+          </div>
         </section>
       )}
 

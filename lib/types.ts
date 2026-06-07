@@ -65,3 +65,15 @@ export interface CourseTopic {
   source_file_ids: string[] | null;
   created_at: string;
 }
+
+export interface Question {
+  id: string;
+  course_id: string;
+  source_file_id: string | null;
+  topic_id: string | null;
+  question_text: string;
+  q_type: string | null;
+  difficulty: string | null;
+  has_solution: boolean;
+  created_at: string;
+}

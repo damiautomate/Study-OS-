@@ -211,3 +211,35 @@ the study agent will read later.
 - Collapsing near-duplicate slide *versions* (beyond exact duplicates).
 - The **question bank** (Slice 5) and **coverage/gap report + review** (Slice 6),
   which complete the onboarding subsystem.
+
+---
+
+## Slice 5 — Question bank (added)
+
+After the spine is built, the worker extracts individual past questions from every
+document flagged as containing questions (assignments, tests, exams, solutions),
+tags each to a topic on the spine, and records its type, difficulty, and whether a
+solution is shown. This is the raw material that later makes practice concrete.
+
+### Extra setup for Slice 5
+1. **SQL editor:** run `supabase/migrations/0005_slice5_questions.sql` (after 0004).
+2. **Edge Function → Secrets** (optional): `QUESTIONS_MODEL` (defaults to Haiku).
+3. Redeploy the worker.
+
+### How it works
+- The chain is now `extract → read → ocr → understand → spine → questions → done`.
+- After the spine, one `questions` job runs per question-bearing document. It feeds
+  the document text **plus the spine's topic titles** to the model, which returns
+  strict JSON of `{text, type, difficulty, topic, has_solution}` per question.
+- Topic tagging is matched **deterministically** back to a real spine topic id
+  (the model can only pick from the supplied list); unmatched → untagged.
+- The course page shows a live **Question bank** card: total, topics covered,
+  count with solutions, and a per-type tally.
+
+### Honest notes / deferred
+- `has_solution` is detected **within the same document** (worked solutions). Matching
+  a separate solutions PDF to an exam's questions is cross-document linking, deferred.
+- Up to 200 questions are taken per document (cap in the worker).
+- Remaining to finish onboarding: **Slice 6 — coverage & review** (gap report:
+  topics with no materials, topics with no questions, unreadable files; plus the
+  final confirmation).
