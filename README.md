@@ -343,3 +343,48 @@ on the course page.
   hard question, surface real-world hooks, advance a capstone), drift *intervention*
   (the agent proactively reaching out when you go quiet), and the engagement-signal
   layer of the student model. Those are the next slices.
+
+---
+
+## Login (added)
+
+Real accounts, layered on top of the guest flow so nothing breaks.
+- The app still starts as an anonymous guest (instant, no friction).
+- **/login** lets you *create an account* — if you're currently a guest, it
+  **upgrades that guest session in place**, so your existing courses/progress carry
+  over (no data loss). Or *sign in* to reach your account from another device.
+- The home page shows your email + sign out, or a "Sign in / create account" link.
+- Supabase setup: **Authentication → Providers → Email** enabled. For the smoothest
+  test, you can turn **"Confirm email" off** (Auth → Providers → Email); with it on,
+  new accounts must confirm via the emailed link before sign-in works.
+
+## Agent Slice 4 — Coaching actions (added)
+
+The agent can now *teach*, not just plan. Each plan item gets three buttons:
+
+- **Explain** — teaches the topic from **its own source materials** (reads the
+  slides/notes tagged to that topic and explains in your course's terms, ending with
+  a self-check). Falls back to a general explanation if no material is tagged.
+- **Practice** — pulls a **real past question** tagged to that topic and breaks it
+  into doable steps (without handing over the full answer).
+- **Why it matters** — a short, real-world use of the topic, using **web search**
+  for current, concrete examples.
+
+### Setup
+1. **SQL editor:** run `0010_agent_coaching.sql` (after 0009).
+2. **Edge Functions → create `agent-coach`**, paste `supabase/functions/agent-coach/index.ts`,
+   **Verify JWT off**, same secrets as the other functions (`ANTHROPIC_API_KEY`,
+   `WORKER_SECRET`; `COACH_MODEL` optional, defaults to Haiku). Deploy.
+3. Redeploy the web app.
+
+### How it works
+- Buttons call `/api/coach`, which fires the `agent-coach` function (grounded in your
+  materials / question bank, web search only for the "why it matters" mode). Results
+  stream back into the panel via Realtime and are saved per topic.
+
+### Honest notes / next
+- Answer-*checking* against stored solutions isn't here yet — we stored whether a
+  solution exists, not its text — so practice scaffolds the approach rather than
+  grading your answer. That's a clean follow-up.
+- Still ahead: proactive **drift intervention** (the agent reaching out when you go
+  quiet), and the richer phases (capstone, real free-choice).

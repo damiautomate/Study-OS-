@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ensureSession } from "@/lib/supabase/client";
-import type { StudyPlan, PlanItem, AgentMessage, StudentMastery } from "@/lib/types";
+import type { StudyPlan, PlanItem, AgentMessage, StudentMastery, Coaching } from "@/lib/types";
 
 const UNDERSTANDING = [
   { key: "shaky", label: "Shaky" },
@@ -18,6 +18,8 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
   const [mastery, setMastery] = useState<Map<string, StudentMastery>>(new Map());
   const [message, setMessage] = useState<AgentMessage | null>(null);
   const [thinking, setThinking] = useState(false);
+  const [coaching, setCoaching] = useState<Coaching[]>([]);
+  const [pending, setPending] = useState<Set<string>>(new Set());
   const supaRef = useRef<Awaited<ReturnType<typeof ensureSession>> | null>(null);
 
   async function loadPlan(supabase: any) {
@@ -50,6 +52,9 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
         .order("created_at", { ascending: false }).limit(1).maybeSingle();
       setMessage((msg as AgentMessage) ?? null);
 
+      const { data: co } = await supabase.from("coaching").select("*").eq("course_id", courseId).order("created_at", { ascending: true });
+      setCoaching((co as Coaching[]) ?? []);
+
       await loadPlan(supabase);
 
       channel = supabase.channel(`agent-${courseId}`)
@@ -57,6 +62,12 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
           () => loadPlan(supabase))
         .on("postgres_changes", { event: "INSERT", schema: "public", table: "agent_messages", filter: `course_id=eq.${courseId}` },
           (p) => { setMessage(p.new as AgentMessage); setThinking(false); })
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "coaching", filter: `course_id=eq.${courseId}` },
+          (p) => {
+            const row = p.new as Coaching;
+            setCoaching((prev) => [...prev, row]);
+            setPending((prev) => { const n = new Set(prev); if (row.topic_id) n.delete(`${row.topic_id}:${row.mode}`); return n; });
+          })
         .subscribe();
     })();
     return () => { if (channel) channel.unsubscribe(); };
@@ -87,6 +98,14 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
       next.set(topicId, { ...cur, topic_id: topicId, last_touched: now, ...patch } as StudentMastery);
       return next;
     });
+  }
+
+  async function runCoach(topicId: string, mode: "explain" | "practice" | "hook") {
+    setPending((prev) => new Set(prev).add(`${topicId}:${mode}`));
+    try {
+      await fetch("/api/coach", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ courseId, topicId, mode }) });
+    } catch { /* */ }
+    setTimeout(() => setPending((prev) => { const n = new Set(prev); n.delete(`${topicId}:${mode}`); return n; }), 60000);
   }
 
   async function toggleDone(item: PlanItem) {
@@ -141,6 +160,34 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
                           </button>
                         ))}
                       </div>
+
+                      {item.topic_id && (
+                        <div className="mt-3 border-t border-line/60 pt-3">
+                          <div className="flex flex-wrap gap-1.5">
+                            {([["explain", "Explain"], ["practice", "Practice"], ["hook", "Why it matters"]] as const).map(([mode, label]) => (
+                              <button key={mode} onClick={() => runCoach(item.topic_id!, mode)}
+                                className="rounded-full border border-gold/30 px-2.5 py-0.5 text-[10px] text-gold-dim transition hover:bg-gold/10">
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                          {(["explain", "practice", "hook"] as const).map((mode) => {
+                            const key = `${item.topic_id}:${mode}`;
+                            const isPending = pending.has(key);
+                            const entries = coaching.filter((c) => c.topic_id === item.topic_id && c.mode === mode);
+                            const latest = entries[entries.length - 1];
+                            if (!isPending && !latest) return null;
+                            return (
+                              <div key={mode} className="mt-2 rounded-lg bg-ink/40 px-3 py-2">
+                                <p className="mb-1 text-[10px] uppercase tracking-wider text-faint">{mode === "hook" ? "Why it matters" : mode}</p>
+                                {isPending && !latest
+                                  ? <p className="text-xs text-muted">thinking…</p>
+                                  : <p className="whitespace-pre-wrap text-xs leading-relaxed text-paper/85">{latest?.body}</p>}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </li>

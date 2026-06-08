@@ -8,10 +8,13 @@ import type { Course } from "@/lib/types";
 export default function Home() {
   const [courses, setCourses] = useState<Course[] | null>(null);
   const [needsIntake, setNeedsIntake] = useState(false);
+  const [account, setAccount] = useState<{ email: string | null; guest: boolean } | null>(null);
 
   useEffect(() => {
     (async () => {
       const supabase = await ensureSession();
+      const { data: { user } } = await supabase.auth.getUser();
+      setAccount({ email: user?.email ?? null, guest: !!user?.is_anonymous });
       const { data: profile } = await supabase.from("student_profile").select("user_id").maybeSingle();
       setNeedsIntake(!profile);
       const { data } = await supabase
@@ -22,8 +25,21 @@ export default function Home() {
     })();
   }, []);
 
+  async function signOut() {
+    const { createClient } = await import("@/lib/supabase/client");
+    await createClient().auth.signOut();
+    window.location.reload();
+  }
+
   return (
     <main className="mx-auto max-w-2xl px-5 py-12 sm:py-20">
+      <div className="mb-8 flex justify-end text-xs">
+        {account?.email ? (
+          <span className="text-faint">{account.email} · <button onClick={signOut} className="hover:text-muted">sign out</button></span>
+        ) : (
+          <Link href="/login" className="text-gold-dim hover:text-gold">Sign in / create account</Link>
+        )}
+      </div>
       <header className="mb-12">
         <p className="text-xs uppercase tracking-[0.3em] text-gold-dim mb-3">Study OS</p>
         <h1 className="text-4xl sm:text-5xl leading-[1.05] text-paper">

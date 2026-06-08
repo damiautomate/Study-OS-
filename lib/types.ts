@@ -132,3 +132,15 @@ export interface AgentMessage {
   body: string;
   created_at: string;
 }
+
+export interface Coaching {
+  id: string;
+  user_id: string;
+  course_id: string | null;
+  topic_id: string | null;
+  question_id: string | null;
+  mode: "explain" | "practice" | "hook";
+  body: string | null;
+  meta: Record<string, unknown> | null;
+  created_at: string;
+}
