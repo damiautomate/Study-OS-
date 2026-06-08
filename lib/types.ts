@@ -104,3 +104,31 @@ export interface StudentMastery {
   last_touched: string | null;
   created_at: string;
 }
+
+export interface StudyPlan {
+  id: string;
+  user_id: string;
+  course_id: string;
+  horizon: string;
+  situation: string | null;
+  active: boolean;
+  created_at: string;
+}
+
+export interface PlanItem {
+  id: string;
+  plan_id: string;
+  topic_id: string | null;
+  order_index: number;
+  reason: string | null;
+  done: boolean;
+}
+
+export interface AgentMessage {
+  id: string;
+  user_id: string;
+  course_id: string | null;
+  kind: string;
+  body: string;
+  created_at: string;
+}

@@ -300,3 +300,46 @@ The first piece of the intelligence layer: the data the agent will read about *y
   reasoning call with a tiny validated action set. First time it *thinks*.
 - **Agent Slice 3 — tracking loop:** record reading/practice → update mastery +
   engagement → drift detection.
+
+---
+
+## Agent Slice 2 & 3 — Heartbeat + tracking loop (added)
+
+The agent now *thinks*. Once a course is onboarded, an **Your agent** panel appears
+on the course page.
+
+### Setup
+1. **SQL editor:** run `0008_agent_heartbeat.sql` then `0009_agent_tracking.sql` (after 0007).
+2. **Edge Functions → create `agent-heartbeat`**, paste `supabase/functions/agent-heartbeat/index.ts`,
+   turn **Verify JWT off**, and make sure the function has the same secrets as the
+   worker (`ANTHROPIC_API_KEY`, `WORKER_SECRET`; `AGENT_MODEL` optional, defaults to
+   Haiku — set `claude-sonnet-4-6` for sharper planning). Deploy.
+3. (Optional, for the daily "presence") add a Supabase cron that POSTs `{}` to the
+   `agent-heartbeat` function with the `x-worker-secret` header — same shape as the
+   worker watchdog cron, just the other function URL. It sweeps onboarded courses
+   that haven't had a beat in ~20h.
+4. Redeploy the web app.
+
+### How it works (Slice 2 — heartbeat)
+- The agent compiles a **snapshot** — your profile, per-topic mastery, the course
+  spine, weeks-to-test/exam, and the last note it sent — and makes ONE reasoning
+  call that returns a strict-JSON situation read + a small **validated action set**:
+  `set_plan` (3–6 ordered topics with reasons), `message_student` (a note matched to
+  how you like to be pushed), or `hold`. Plan topics are matched back to real spine
+  topics in code; nothing invented. Every action is logged to `agent_actions`.
+- Trigger it manually with **Plan my week**, or let the cron wake it daily.
+
+### How it works (Slice 3 — tracking)
+- On each plan item you mark understanding (Shaky / Getting it / Solid) or tick it
+  done. That updates `student_mastery` and stamps `last_active_at` + a `study_log`
+  row. The next heartbeat reads that updated state (including **days since last
+  studied**), so the loop closes: perceive → plan → you act → it re-perceives.
+
+### Honest notes / next
+- The reasoning prompt already encodes the guardrails (match accountability style,
+  never shame, cut scope near exams rather than pile on), but those are only as good
+  as the model follows them — worth watching the first few plans.
+- Not yet built: the richer action families (re-explain a stuck topic, scaffold a
+  hard question, surface real-world hooks, advance a capstone), drift *intervention*
+  (the agent proactively reaching out when you go quiet), and the engagement-signal
+  layer of the student model. Those are the next slices.

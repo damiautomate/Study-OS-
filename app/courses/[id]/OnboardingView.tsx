@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ensureSession } from "@/lib/supabase/client";
+import AgentPanel from "./AgentPanel";
 import type { Course, OnboardingRun, RunEvent, SourceFile, CourseTopic, Question } from "@/lib/types";
 
 const STATUS_LABEL: Record<string, string> = {
@@ -208,6 +209,8 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
           ✓ Onboarded{tracking ? ` — tracking your progress across ${tracking} topics` : ""}
         </p>
       )}
+
+      {course?.status === "onboarded" && <AgentPanel courseId={courseId} />}
 
       {/* progress */}
       <div className="mb-8">
