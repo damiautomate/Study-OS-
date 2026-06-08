@@ -7,10 +7,13 @@ import type { Course } from "@/lib/types";
 
 export default function Home() {
   const [courses, setCourses] = useState<Course[] | null>(null);
+  const [needsIntake, setNeedsIntake] = useState(false);
 
   useEffect(() => {
     (async () => {
       const supabase = await ensureSession();
+      const { data: profile } = await supabase.from("student_profile").select("user_id").maybeSingle();
+      setNeedsIntake(!profile);
       const { data } = await supabase
         .from("courses")
         .select("*")
@@ -39,6 +42,13 @@ export default function Home() {
       >
         + New course
       </Link>
+
+      {needsIntake && (
+        <Link href="/welcome" className="mt-6 block rounded-xl border border-gold/30 bg-gold/5 px-5 py-4 transition hover:border-gold/60">
+          <p className="text-sm text-paper">Tell the agent about you →</p>
+          <p className="mt-0.5 text-xs text-muted">A one-minute intake so guidance is built around your goals, not generic.</p>
+        </Link>
+      )}
 
       <section className="mt-12">
         {courses === null ? (

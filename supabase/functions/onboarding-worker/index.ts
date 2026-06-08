@@ -28,11 +28,11 @@ const BUCKET = "course-uploads";
 const MAX_FILES = 500;
 const MAX_TOTAL_UNCOMPRESSED = 300 * 1024 * 1024;
 const MAX_ATTEMPTS = 4;
-const OCR_CHUNK_PAGES = 20;
-const MAX_OCR_PAGES = 200;
+const OCR_CHUNK_PAGES = Number(Deno.env.get("OCR_CHUNK_PAGES") ?? "8");
+const MAX_OCR_PAGES = Number(Deno.env.get("MAX_OCR_PAGES") ?? "200");
 const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
-const MAX_UNDERSTAND_CHARS = 120000;
+const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
 
 const OCR_PROMPT =
   "Transcribe all readable text from this document verbatim, preserving reading order. " +
@@ -182,16 +182,32 @@ async function failJobAndRun(job: any, runId: string, msg: string) {
   }
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function callClaude(model: string, content: unknown[], maxTokens: number): Promise<{ text: string; usage: any }> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
-  });
-  if (!res.ok) throw new Error(`Claude ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const data = await res.json();
-  const text = (data.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("").trim();
-  return { text, usage: data.usage ?? {} };
+  let lastErr = "call failed";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const text = (data.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("").trim();
+      return { text, usage: data.usage ?? {} };
+    }
+    lastErr = `Claude ${res.status}: ${(await res.text()).slice(0, 160)}`;
+    // 429 = rate limited, 529 = overloaded, 5xx = transient -> back off and retry
+    if (res.status === 429 || res.status === 529 || res.status >= 500) {
+      const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
+      const backoff = Math.min(45, Number.isFinite(ra) && ra > 0 ? ra : Math.pow(2, attempt) * 4);
+      await sleep(backoff * 1000 + Math.floor(Math.random() * 800));
+      continue;
+    }
+    throw new Error(lastErr); // non-retryable (bad request, auth, etc.)
+  }
+  throw new Error(lastErr);
 }
 
 // ---------- stage: extract ----------
@@ -568,7 +584,7 @@ async function doQuestions(job: any) {
     const dl = await db.storage.from(BUCKET).download(file.text_path);
     if (dl.error || !dl.data) throw new Error("text missing");
     let text = await dl.data.text();
-    if (text.length > 100000) text = text.slice(0, 100000);
+    if (text.length > MAX_UNDERSTAND_CHARS) text = text.slice(0, MAX_UNDERSTAND_CHARS);
 
     const { data: topicRows } = await db.from("course_topics").select("id, title").eq("course_id", courseId).eq("level", 2);
     const topics = (topicRows ?? []) as { id: string; title: string }[];

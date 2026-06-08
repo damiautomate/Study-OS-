@@ -273,3 +273,30 @@ question bank, and an honest coverage report — confirmed by you.
 
 **This is the point to run one real course end-to-end before the agent layer
 (student model, heartbeat, phases 2–8) gets built on top of it.**
+
+---
+
+## Agent Slice 1 — Student foundation (added)
+
+The first piece of the intelligence layer: the data the agent will read about *you*.
+
+### Setup
+1. **SQL editor:** run `supabase/migrations/0007_agent_student_foundation.sql` (after 0006).
+2. No new function/secrets. Redeploy the web app.
+
+### What it adds
+- `student_profile` — a one-minute intake at **/welcome** (goal, what you'd love to
+  build, what's tripped you up before, how you want to be pushed, study hours). The
+  home page prompts for it if it's missing. Seeds the slow-changing layers of the
+  student model. No AI — a plain form.
+- `student_mastery` — one row per (you, topic), seeded the moment you click
+  **finish onboarding** on a course: every spine topic starts `not_started` /
+  `unknown`. This is the per-topic state the agent reads to decide what you study.
+  The course page shows "tracking your progress across N topics" once seeded.
+
+### What's next
+- **Agent Slice 2 — heartbeat skeleton:** cron wakes the agent, it compiles a
+  snapshot (profile + mastery + course KB) and produces a study plan via one
+  reasoning call with a tiny validated action set. First time it *thinks*.
+- **Agent Slice 3 — tracking loop:** record reading/practice → update mastery +
+  engagement → drift detection.

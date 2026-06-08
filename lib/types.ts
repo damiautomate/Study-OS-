@@ -79,3 +79,28 @@ export interface Question {
   has_solution: boolean;
   created_at: string;
 }
+
+export interface StudentProfile {
+  id: string;
+  user_id: string;
+  study_hours_per_day: number | null;
+  semester_goal: string | null;
+  motivation: string | null;
+  past_struggles: string[] | null;
+  accountability_style: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StudentMastery {
+  id: string;
+  user_id: string;
+  course_id: string;
+  topic_id: string;
+  reading_state: "not_started" | "in_progress" | "read";
+  understanding_state: "unknown" | "shaky" | "developing" | "solid";
+  attempts: number;
+  last_score: number | null;
+  last_touched: string | null;
+  created_at: string;
+}

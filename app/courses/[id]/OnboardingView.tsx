@@ -51,6 +51,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const [files, setFiles] = useState<SourceFile[]>([]);
   const [topics, setTopics] = useState<CourseTopic[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
+  const [tracking, setTracking] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
   const feedEnd = useRef<HTMLDivElement>(null);
 
@@ -91,6 +92,10 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
       const { data: qs } = await supabase
         .from("questions").select("*").eq("course_id", courseId);
       setQuestions((qs as Question[]) ?? []);
+
+      const { count: mcount } = await supabase
+        .from("student_mastery").select("id", { count: "exact", head: true }).eq("course_id", courseId);
+      setTracking(mcount ?? 0);
 
       channel = supabase
         .channel(`run-${runRow.id}`)
@@ -160,6 +165,13 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
     const supabase = await ensureSession();
     await supabase.from("courses").update({ status: "onboarded" }).eq("id", courseId);
     setCourse((c) => (c ? { ...c, status: "onboarded" } : c));
+    // seed per-topic mastery so the agent can track progress from here
+    const leaf = topics.filter((t) => t.level === 2);
+    if (leaf.length > 0) {
+      const rows = leaf.map((t) => ({ course_id: courseId, topic_id: t.id }));
+      await supabase.from("student_mastery").upsert(rows, { onConflict: "user_id,topic_id", ignoreDuplicates: true });
+      setTracking(leaf.length);
+    }
   }
 
   if (loaded && !run) {
@@ -192,7 +204,9 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         </div>
       )}
       {course?.status === "onboarded" && (
-        <p className="mb-8 text-sm text-sage">✓ Onboarded</p>
+        <p className="mb-8 text-sm text-sage">
+          ✓ Onboarded{tracking ? ` — tracking your progress across ${tracking} topics` : ""}
+        </p>
       )}
 
       {/* progress */}
