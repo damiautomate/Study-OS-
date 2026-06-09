@@ -1,23 +1,30 @@
-import type { Metadata } from "next";
-import { Newsreader, Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import { Bricolage_Grotesque, Schibsted_Grotesk, Spline_Sans_Mono } from "next/font/google";
 import "./globals.css";
 import Nav from "./Nav";
 
-const newsreader = Newsreader({ subsets: ["latin"], variable: "--font-newsreader", style: ["normal", "italic"] });
-const hanken = Hanken_Grotesk({ subsets: ["latin"], variable: "--font-hanken" });
-const mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono-jb" });
+const brico = Bricolage_Grotesque({ subsets: ["latin"], variable: "--font-brico" });
+const schibsted = Schibsted_Grotesk({ subsets: ["latin"], variable: "--font-schibsted" });
+const splineMono = Spline_Sans_Mono({ subsets: ["latin"], variable: "--font-spline-mono" });
 
 export const metadata: Metadata = {
   title: "Study OS",
   description: "Your whole semester — understood.",
 };
 
+export const viewport: Viewport = {
+  themeColor: "#fbf7f0",
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className={`${newsreader.variable} ${hanken.variable} ${mono.variable} antialiased`}>
+      <body className={`${brico.variable} ${schibsted.variable} ${splineMono.variable} antialiased`}>
         <Nav />
-        <div className="min-h-dvh">{children}</div>
+        <div className="min-h-dvh pb-20 sm:pb-0">{children}</div>
       </body>
     </html>
   );

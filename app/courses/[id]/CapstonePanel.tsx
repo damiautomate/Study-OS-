@@ -87,7 +87,7 @@ export default function CapstonePanel({ courseId }: { courseId: string }) {
         <div className="space-y-2">
           <p className="mb-1 text-xs text-faint">Pick one to make it your capstone — its milestones will unlock as you master the topics they need.</p>
           {proposed.map((c) => (
-            <div key={c.id} className="rounded-lg bg-surface/50 px-4 py-3">
+            <div key={c.id} className="rounded-lg bg-raised/60 px-4 py-3">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <p className="text-sm text-paper">{c.title} <span className="ml-1 label text-faint">{c.kind}</span></p>
@@ -122,7 +122,7 @@ export default function CapstonePanel({ courseId }: { courseId: string }) {
                   const open = unlocked(m);
                   const need = (m.required_topic_ids ?? []).map((id) => ({ id, title: titles.get(id) ?? "—", ok: solid.has(id) }));
                   return (
-                    <li key={m.id} className={`rounded-lg px-4 py-3 ${open ? "bg-surface/60" : "bg-surface/20"}`}>
+                    <li key={m.id} className={`rounded-lg px-4 py-3 ${open ? "bg-ink" : "bg-surface/20"}`}>
                       <div className="flex items-start gap-2">
                         {open ? (
                           <input type="checkbox" checked={m.done} onChange={() => toggleMilestone(m)} className="mt-0.5 accent-gold" />

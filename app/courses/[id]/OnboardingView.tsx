@@ -57,7 +57,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [tracking, setTracking] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [tab, setTab] = useState<"overview" | "plan" | "capstone" | "materials">("overview");
+  const [tab, setTab] = useState<"plan" | "coach" | "capstone" | "materials">("plan");
   const feedEnd = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -306,7 +306,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
     </div>
   );
 
-  const TABS = [["overview", "Overview"], ["plan", "Plan"], ["capstone", "Capstone"], ["materials", "Materials"]] as const;
+  const TABS = [["plan", "This week"], ["coach", "Coach"], ["capstone", "Capstone"], ["materials", "Library"]] as const;
 
   return (
     <main className="mx-auto max-w-3xl px-5 pb-24 pt-6 sm:pt-8">
@@ -329,32 +329,28 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
 
       {onboarded ? (
         <>
-          <nav className="mb-8 flex gap-1 border-b border-line">
-            {TABS.map(([k, label]) => (
-              <button key={k} onClick={() => setTab(k)} className={`relative px-3 py-2 text-sm transition ${tab === k ? "text-paper" : "text-faint hover:text-muted"}`}>
-                {label}
-                {tab === k && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded bg-gold" />}
-              </button>
-            ))}
+          <nav className="sticky top-12 z-30 -mx-5 mb-7 overflow-x-auto border-b border-line/70 bg-ink/90 px-5 py-2 backdrop-blur-md">
+            <div className="flex w-max gap-1.5">
+              {TABS.map(([k, label]) => (
+                <button key={k} onClick={() => setTab(k)}
+                  className={`whitespace-nowrap rounded-full px-3.5 py-1.5 text-sm transition ${tab === k ? "bg-paper font-medium text-ink shadow-sm" : "bg-surface text-muted border border-line hover:text-paper"}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
           </nav>
 
-          {tab === "overview" && (
-            <div className="space-y-8 rise">
-              {tracking ? <p className="text-sm text-sage">✓ Tracking your progress across {tracking} topics.</p> : null}
-              {coverage}
-              <p className="text-sm text-muted">Head to <button onClick={() => setTab("plan")} className="text-gold-dim underline-offset-2 hover:underline">Plan</button> for your weekly focus and practice, or <button onClick={() => setTab("capstone")} className="text-gold-dim underline-offset-2 hover:underline">Capstone</button> for the end-goal this builds toward.</p>
-            </div>
-          )}
-          {tab === "plan" && (<div className="rise"><SchedulePanel courseId={courseId} /><AgentPanel courseId={courseId} /></div>)}
+          {tab === "plan" && (<div className="rise"><SchedulePanel courseId={courseId} /></div>)}
+          {tab === "coach" && (<div className="rise"><AgentPanel courseId={courseId} /></div>)}
           {tab === "capstone" && (<div className="rise"><CapstonePanel courseId={courseId} /></div>)}
-          {tab === "materials" && (<div className="space-y-10 rise">{courseMap}{questionBank}{inventory}</div>)}
+          {tab === "materials" && (<div className="space-y-10 rise">{coverage}{courseMap}{questionBank}{inventory}</div>)}
         </>
       ) : (
         <div className="space-y-10">
           {isDone && course?.status === "review" && (
             <div className="rounded-xl border border-gold/30 bg-gold/5 p-5 rise">
               <p className="text-sm text-paper">Onboarding complete. Check the map, question bank, and gaps — then confirm.</p>
-              <button onClick={confirmOnboarding} className="mt-3 rounded-full bg-gold px-5 py-2 text-sm font-medium text-ink transition hover:bg-paper">Looks right — finish onboarding</button>
+              <button onClick={confirmOnboarding} className="mt-3 rounded-full bg-gold px-5 py-2 text-sm font-medium text-ink transition hover:bg-gold-dim">Looks right — finish onboarding</button>
             </div>
           )}
           {progress}

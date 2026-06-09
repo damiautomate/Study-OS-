@@ -210,7 +210,7 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
       {messages.length > 0 && (
         <div className="mb-5 space-y-2">
           {messages.slice(0, 3).map((mm, i) => (
-            <div key={mm.id} className={`rounded-lg px-4 py-3 text-sm leading-relaxed ${i === 0 ? "bg-surface/80 text-paper/90" : "bg-surface/40 text-muted"}`}>
+            <div key={mm.id} className={`rounded-lg px-4 py-3 text-sm leading-relaxed ${i === 0 ? "bg-raised/70 text-paper/90" : "bg-raised/50 text-muted"}`}>
               {mm.body}
             </div>
           ))}
@@ -289,7 +289,7 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
                             const cv = (lastCheck?.meta as any)?.verdict as string | undefined;
                             const vColor = cv === "correct" ? "text-sage" : cv === "incorrect" ? "text-rust" : "text-gold";
                             return (
-                              <div key={mode} className="mt-2 rounded-lg bg-ink/40 px-3 py-2">
+                              <div key={mode} className="mt-2 rounded-lg bg-raised/70 px-3 py-2">
                                 <p className="mb-1 label text-faint">{mode}</p>
                                 {isPending && !latest
                                   ? <p className="text-xs text-muted">thinking…</p>
@@ -301,7 +301,7 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
                                       onChange={(e) => setAnswers((prev) => ({ ...prev, [qid]: e.target.value }))}
                                       placeholder="Work it out, then write your answer here…"
                                       rows={3}
-                                      className="w-full rounded-md border border-line bg-surface/60 px-2.5 py-2 text-xs text-paper outline-none focus:border-gold-dim"
+                                      className="w-full rounded-md border border-line bg-ink px-2.5 py-2 text-xs text-paper outline-none focus:border-gold-dim"
                                     />
                                     <button
                                       onClick={() => checkAnswer(item.topic_id!, qid)}
@@ -310,7 +310,7 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
                                       {checkPending ? "Checking…" : "Check my answer"}
                                     </button>
                                     {lastCheck && (
-                                      <div className="mt-2 rounded-md bg-ink/60 px-2.5 py-2">
+                                      <div className="mt-2 rounded-md bg-raised px-2.5 py-2">
                                         <p className={`mb-1 label ${vColor}`}>
                                           {cv ?? "checked"}{typeof (lastCheck.meta as any)?.score === "number" ? ` · ${(lastCheck.meta as any).score}/100` : ""}
                                           {(lastCheck.meta as any)?.graded_on === "materials_only" ? " · no official key" : ""}

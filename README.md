@@ -696,3 +696,41 @@ No migration, no function changes — redeploy the web app.
   courses).
 - **Out-of-app nudges** (email/WhatsApp) for drift — consistency when you're not in the
   app.
+
+---
+
+## Redesign v2 — "Paper & Flame" (full reset · web-only)
+
+A complete visual + structural redesign in response to feedback that the dark/gold look
+felt AI-generic and navigation still scrolled too much. No migration, no function
+changes — redeploy the web app.
+
+### The look
+- **Paper & Flame**: warm cream paper surface, near-black ink, ONE hot tangerine accent
+  (actions, streaks), deep green for mastery. Feels like a beautifully printed student
+  planner, not an AI dashboard.
+- Fonts: **Bricolage Grotesque** (display) + **Schibsted Grotesk** (body) +
+  **Spline Sans Mono** (numbers/labels). Soft paper shadows (`.card`), tactile round
+  checkboxes, check-pop micro-animation, rounded-2xl geometry.
+- Token names unchanged — values re-meant (ink=page, paper=text, gold=flame), so the
+  entire app flipped consistently; legacy dark "wells" retoned for paper.
+
+### Mobile-first structure (the navigation fix)
+- **Bottom tab bar** on mobile (thumb-first): **Today · Courses · You**; same nav inline
+  on desktop. Safe-area aware.
+- **Today (`/`)** — the new home: date + greeting, **streak flame** (computed from
+  study_log, with "streak safe / keep it alive" state), **Up next: top 3** across all
+  courses (urgency-sorted, "start" marker, satisfying check-off), next 3 deadlines.
+  Open app → know exactly what to do → do it → flame grows. Short by design.
+- **Courses (`/courses`)** — compact exam-aware grid (mastery bar, quiet flag, next
+  date), Add + Free-choice actions, friendly empty state.
+- **You (`/you`)** — month snapshot (days studied, topics mastered), editable goal +
+  capacity, account/upgrade-from-guest.
+- **Course pages** — sticky horizontally-scrollable pill tabs; schedule and coach SPLIT
+  into separate tabs (**This week · Coach · Capstone · Library**) so no tab is a long
+  scroll; coverage folded into Library.
+
+### Healthy "addictive" mechanics
+Streak + today-state dot + "start here" + check-pop + monthly stats — engagement aimed
+at *showing up to study*, consistent with the app's purpose (needing it less over time),
+not dark-pattern retention.

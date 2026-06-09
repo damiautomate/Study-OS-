@@ -110,7 +110,7 @@ export default function Welcome() {
         {error && <p className="text-sm text-rust">{error}</p>}
 
         <button onClick={save} disabled={busy}
-          className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-paper disabled:opacity-50">
+          className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-gold-dim disabled:opacity-50">
           {busy ? "Saving…" : "Save & continue"}
         </button>
       </div>

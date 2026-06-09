@@ -114,7 +114,7 @@ export default function NewCourse() {
         <button
           onClick={submit}
           disabled={busy}
-          className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-paper disabled:opacity-50"
+          className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-gold-dim disabled:opacity-50"
         >
           {busy ? status || "Working…" : "Start onboarding"}
         </button>

@@ -1,22 +1,24 @@
 @import "tailwindcss";
 
 @theme {
-  /* nocturne editorial — cooler deep ink, warm ivory, clean brass */
-  --color-ink: #090a0e;
-  --color-surface: #111319;
-  --color-raised: #191c24;
-  --color-line: #262a33;
-  --color-paper: #ede9df;
-  --color-muted: #9b978a;
-  --color-faint: #615f56;
-  --color-gold: #e3a73e;
-  --color-gold-dim: #a47f3c;
-  --color-sage: #82a98b;
-  --color-rust: #cf6f54;
+  /* PAPER & FLAME — warm daylight paper, ink text, one hot accent.
+     Token NAMES kept for compatibility; values re-meaning:
+     ink = page bg · paper = text · surface/raised = cards/wells · gold = flame accent */
+  --color-ink: #fbf7f0;
+  --color-surface: #ffffff;
+  --color-raised: #f3ede2;
+  --color-line: #e8dfd0;
+  --color-paper: #211d16;
+  --color-muted: #6e675b;
+  --color-faint: #9c9484;
+  --color-gold: #e8501a;
+  --color-gold-dim: #b4451e;
+  --color-sage: #3e7c4f;
+  --color-rust: #b3261e;
 
-  --font-display: var(--font-newsreader), Georgia, serif;
-  --font-body: var(--font-hanken), system-ui, sans-serif;
-  --font-mono: var(--font-mono-jb), ui-monospace, monospace;
+  --font-display: var(--font-brico), Georgia, serif;
+  --font-body: var(--font-schibsted), system-ui, sans-serif;
+  --font-mono: var(--font-spline-mono), ui-monospace, monospace;
 }
 
 html {
@@ -28,29 +30,34 @@ html {
 body {
   font-family: var(--font-body);
   background:
-    radial-gradient(140% 80% at 50% -20%, rgba(227, 167, 62, 0.07), transparent 50%),
-    radial-gradient(120% 120% at 100% 0%, rgba(130, 169, 139, 0.04), transparent 45%),
+    radial-gradient(110% 60% at 85% -10%, rgba(232, 80, 26, 0.05), transparent 55%),
+    radial-gradient(90% 70% at 0% 100%, rgba(62, 124, 79, 0.045), transparent 50%),
     var(--color-ink);
-  letter-spacing: 0.01em;
+  letter-spacing: 0.005em;
 }
 
-h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.015em; }
+h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.02em; }
 
 .font-mono { font-family: var(--font-mono); }
 
-/* labels: small, tracked, mono — the "instrument" detail (color set per-use) */
+/* labels: small, tracked, mono — the instrument detail (color set per-use) */
 .label {
   font-family: var(--font-mono);
   font-size: 10px;
-  letter-spacing: 0.22em;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
 }
 
-::selection { background: rgba(227, 167, 62, 0.25); }
+/* soft paper shadow for cards */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  box-shadow: 0 1px 2px rgba(33, 29, 22, 0.04), 0 10px 28px -16px rgba(33, 29, 22, 0.14);
+}
 
-*:focus-visible { outline: 1px solid var(--color-gold-dim); outline-offset: 2px; }
+::selection { background: rgba(232, 80, 26, 0.18); }
+*:focus-visible { outline: 2px solid rgba(232, 80, 26, 0.55); outline-offset: 2px; border-radius: 4px; }
 
-/* refined scrollbars */
 * { scrollbar-width: thin; scrollbar-color: var(--color-line) transparent; }
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 8px; }
@@ -61,3 +68,6 @@ h1, h2, h3 { font-family: var(--font-display); letter-spacing: -0.015em; }
 
 @keyframes pulse-dot { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
 .pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+
+@keyframes pop { 0% { transform: scale(1); } 40% { transform: scale(1.25); } 100% { transform: scale(1); } }
+.pop { animation: pop 0.35s cubic-bezier(0.2, 0.7, 0.2, 1); }

@@ -92,7 +92,7 @@ export default function SchedulePanel({ courseId }: { courseId: string }) {
   const weeks = [...byWeek.keys()].sort((a, b) => a - b);
 
   return (
-    <section className="mb-10 rounded-xl border border-line bg-surface/30 p-5">
+    <section className="mb-10 rounded-xl border border-line bg-surface p-5">
       <div className="mb-4 flex items-center justify-between">
         <h2 className="label text-gold-dim">Semester schedule</h2>
         <div className="flex gap-2">
@@ -106,7 +106,7 @@ export default function SchedulePanel({ courseId }: { courseId: string }) {
       </div>
 
       {settingsOpen && (
-        <div className="mb-5 grid grid-cols-2 gap-3 rounded-lg bg-ink/40 p-4 text-xs sm:grid-cols-3">
+        <div className="mb-5 grid grid-cols-2 gap-3 rounded-lg bg-raised/70 p-4 text-xs sm:grid-cols-3">
           <label className="flex flex-col gap-1 text-faint">Exam date
             <input type="date" value={examDate} onChange={(e) => setExamDate(e.target.value)} className="rounded-md border border-line bg-surface px-2 py-1.5 text-paper" />
           </label>
@@ -150,7 +150,7 @@ export default function SchedulePanel({ courseId }: { courseId: string }) {
             const testHere = within((summary?.testDate ?? testDate) || null, ws, we);
             const doneN = wi.filter((x) => x.done).length;
             return (
-              <div key={w} className={`rounded-lg px-4 py-3 ${isNow ? "border border-gold/30 bg-gold/[0.04]" : "bg-surface/40"}`}>
+              <div key={w} className={`rounded-lg px-4 py-3 ${isNow ? "border border-gold/30 bg-gold/[0.04]" : "bg-raised/50"}`}>
                 <div className="mb-1.5 flex items-center justify-between text-[11px]">
                   <span className={isNow ? "text-gold" : "text-muted"}>
                     {isNow ? "This week" : `Week ${w}`} · {fmt(ws)}–{fmt(we)}

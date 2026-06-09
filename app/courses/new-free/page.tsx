@@ -91,7 +91,7 @@ export default function NewFreeCourse() {
           <input type="date" value={target} onChange={(e) => setTarget(e.target.value)} className="mt-1 w-full rounded-lg border border-line bg-surface px-3 py-2.5 text-paper outline-none focus:border-gold-dim" />
         </label>
         {error && <p className="text-sm text-rust">{error}</p>}
-        <button onClick={create} className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-paper">
+        <button onClick={create} className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-gold-dim">
           Build my curriculum
         </button>
       </div>

@@ -59,7 +59,7 @@ export default function Login() {
         <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" placeholder="Password" className="input" autoComplete={mode === "create" ? "new-password" : "current-password"} />
         {error && <p className="text-sm text-rust">{error}</p>}
         {msg && <p className="text-sm text-sage">{msg}</p>}
-        <button onClick={submit} disabled={busy} className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-paper disabled:opacity-50">
+        <button onClick={submit} disabled={busy} className="w-full rounded-full bg-gold py-3 text-sm font-medium text-ink transition hover:bg-gold-dim disabled:opacity-50">
           {busy ? "…" : mode === "create" ? "Create account" : "Sign in"}
         </button>
       </div>
