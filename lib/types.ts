@@ -10,6 +10,12 @@ export interface Course {
   semester_start: string;
   test_window: string | null;
   exam_window: string | null;
+  test_date: string | null;
+  exam_date: string | null;
+  weight: number;
+  free_choice: boolean;
+  target_date: string | null;
+  target_goal: string | null;
   status: string;
   created_at: string;
 }
@@ -77,6 +83,7 @@ export interface Question {
   q_type: string | null;
   difficulty: string | null;
   has_solution: boolean;
+  solution_text: string | null;
   created_at: string;
 }
 
@@ -84,6 +91,7 @@ export interface StudentProfile {
   id: string;
   user_id: string;
   study_hours_per_day: number | null;
+  study_days_per_week: number;
   semester_goal: string | null;
   motivation: string | null;
   past_struggles: string[] | null;
@@ -139,8 +147,60 @@ export interface Coaching {
   course_id: string | null;
   topic_id: string | null;
   question_id: string | null;
-  mode: "explain" | "practice" | "hook";
+  mode: "explain" | "practice" | "hook" | "check";
   body: string | null;
   meta: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface ApplicationNote {
+  id: string;
+  user_id: string;
+  course_id: string | null;
+  topic_id: string | null;
+  why: string | null;
+  uses: string[] | null;
+  sources: { title: string; url: string }[] | null;
+  cross_links: { course: string; topic: string; link: string }[] | null;
+  depth: string[] | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleItem {
+  id: string;
+  user_id: string;
+  course_id: string;
+  topic_id: string | null;
+  week_index: number;
+  week_start: string;
+  week_end: string;
+  kind: "learn" | "revise";
+  order_index: number;
+  done: boolean;
+  created_at: string;
+}
+
+export interface Capstone {
+  id: string;
+  user_id: string;
+  course_id: string | null;
+  title: string;
+  kind: "project" | "paper";
+  summary: string | null;
+  status: "proposed" | "active" | "done";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CapstoneMilestone {
+  id: string;
+  user_id: string;
+  capstone_id: string;
+  order_index: number;
+  title: string;
+  detail: string | null;
+  required_topic_ids: string[] | null;
+  done: boolean;
   created_at: string;
 }

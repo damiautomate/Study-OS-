@@ -3,8 +3,8 @@ import { createServerSupabase } from "@/lib/supabase/server";
 
 export async function POST(req: Request) {
   try {
-    const { courseId, topicId, mode, questionId } = await req.json();
-    if (!courseId || !topicId || !mode) return NextResponse.json({ error: "missing fields" }, { status: 400 });
+    const { courseId, topicId, mode, questionId, answer, capstoneId, topic, goal } = await req.json();
+    if (!mode) return NextResponse.json({ error: "missing mode" }, { status: 400 });
 
     const supabase = await createServerSupabase();
     const { data: auth } = await supabase.auth.getUser();
@@ -17,7 +17,12 @@ export async function POST(req: Request) {
         Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ mode, course_id: courseId, topic_id: topicId, user_id: auth.user.id, question_id: questionId ?? null }),
+      body: JSON.stringify({
+        mode, user_id: auth.user.id,
+        course_id: courseId ?? null, topic_id: topicId ?? null,
+        question_id: questionId ?? null, answer: answer ?? null,
+        capstone_id: capstoneId ?? null, topic: topic ?? null, goal: goal ?? null,
+      }),
     }).catch(() => {});
 
     return NextResponse.json({ ok: true });

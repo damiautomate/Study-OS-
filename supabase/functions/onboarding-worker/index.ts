@@ -593,8 +593,8 @@ async function doQuestions(job: any) {
     const prompt =
       "You are extracting practice questions from one document in a university course. " +
       "Identify each distinct question or problem posed to the student. " +
-      'Return ONLY JSON: {"questions":[{"text":"the full question","type":"mcq|short|essay|numerical|proof|other","difficulty":"easy|medium|hard","topic":"best-matching topic from the list, or null","has_solution":true|false}]}. ' +
-      "Set has_solution true only if the answer/solution is shown in THIS document. " +
+      'Return ONLY JSON: {"questions":[{"text":"the full question","type":"mcq|short|essay|numerical|proof|other","difficulty":"easy|medium|hard","topic":"best-matching topic from the list, or null","has_solution":true|false,"solution":"the full worked solution or final answer EXACTLY as shown in THIS document, or null"}]}. ' +
+      "Set has_solution true only if the answer/solution is shown in THIS document, and when it is, put the actual solution text verbatim (including any working) in \"solution\". If no solution is shown, set has_solution false and solution null. Never invent a solution. " +
       "Choose topic ONLY from this list (or null if none fits): " + JSON.stringify(topicList) +
       ". If the document has no questions, return {\"questions\":[]}.\n\nDocument text:\n\n" + text;
 
@@ -621,6 +621,7 @@ async function doQuestions(job: any) {
           for (const [tn, id] of topicByNorm) { if (tn.includes(n) || n.includes(tn)) { topicId = id; break; } }
         }
       }
+      const solutionText = typeof q?.solution === "string" && q.solution.trim() ? q.solution.trim().slice(0, 6000) : null;
       rows.push({
         course_id: courseId,
         source_file_id: file.id,
@@ -628,7 +629,8 @@ async function doQuestions(job: any) {
         question_text: qtext.slice(0, 4000),
         q_type: Q_TYPES.includes(q?.type) ? q.type : "other",
         difficulty: Q_DIFF.includes(q?.difficulty) ? q.difficulty : null,
-        has_solution: !!q?.has_solution,
+        has_solution: !!(q?.has_solution || solutionText),
+        solution_text: solutionText,
       });
     }
 

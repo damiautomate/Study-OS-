@@ -388,3 +388,311 @@ The agent can now *teach*, not just plan. Each plan item gets three buttons:
   grading your answer. That's a clean follow-up.
 - Still ahead: proactive **drift intervention** (the agent reaching out when you go
   quiet), and the richer phases (capstone, real free-choice).
+
+---
+
+## Agent Slice 5 — Drift intervention + engagement (added) · code-only
+
+The agent stops being purely reactive. No new migration — this reuses `study_log`,
+the agent tables, and the topic→materials links already in place.
+
+### What changed
+- **Engagement signals** in the heartbeat snapshot: days since last studied, active
+  days in the last 7, and current-plan adherence (items done / plan age). The agent
+  now sees not just *what* you know but *whether you're showing up*.
+- **Proactive outreach**: the prompt instructs the agent to reach out first when
+  you've gone quiet (3+ days) or adherence is low — with ONE tiny, concrete re-entry
+  step matched to your accountability style, never shaming, and to shrink scope (not
+  pile on) when you're behind. It acknowledges consistency when you're showing up.
+- **Sweep cadence**: the cron now runs a beat for any onboarded course the agent
+  hasn't touched in ~20h (was: only if no recent plan) — so the daily check-in can
+  actually catch drift. (Still needs the cron configured; the manual button also
+  triggers a beat for testing.)
+- **Materials on every recommendation** (your note): each plan item now shows
+  exactly **which of your notes to read** and **how many questions** are tagged to
+  that topic — the recommendation points at your real resources, not just a title.
+
+### Files changed
+`supabase/functions/agent-heartbeat/index.ts` (redeploy it) and the course-page
+agent panel. Nothing else to run.
+
+### Still ahead
+- Tapping a material to actually open it (signed URL to the stored file).
+- Answer-checking against stored solutions; richer phases (capstone, free-choice).
+
+---
+
+## Tap-to-open materials (added) · code-only
+
+The material names on each plan item are now **tappable** — clicking one opens the
+actual file (the slide/note PDF, image, etc.) in a new tab.
+
+### How it works
+- Files live in the private `course-uploads` bucket under worker-written paths, so
+  the client can't read them directly. `/api/material` verifies you own the file
+  (via RLS on `source_files`) and returns a **short-lived signed URL** (5 min) minted
+  with the service role. The browser opens that URL.
+
+### Files changed
+`app/api/material/route.ts` (new) and the agent panel. No migration — just redeploy
+the web app.
+
+### Still ahead
+- Answer-checking against stored solutions (needs storing solution text).
+- Richer phases: capstone, free-choice course.
+
+---
+
+## Agent Slice 6 — Answer-checking (added)
+
+The agent can now check a worked answer and **teach from the mistake**, grading
+against the **real solution from your own materials** when one exists. This turns an
+attempt into the strongest signal in the student model.
+
+### Deploy (order matters)
+1. **SQL editor:** run `0011_agent_answer_checking.sql` (after 0010). Adds
+   `questions.solution_text` and a `question_attempts` log.
+2. **Redeploy `onboarding-worker`** — the questions stage now also captures the
+   verbatim solution text when it appears in a document (never invents one).
+3. **Redeploy `agent-coach`** — adds the `check` mode (grading + mastery update).
+4. **Redeploy the web app.**
+
+### The flow
+- Tap **Practice** on a topic → a real past question + how-to-approach steps.
+- Work it out, type your answer, tap **Check my answer**.
+- The agent returns a **verdict** (correct / partial / incorrect), a score, and
+  **specific** feedback — what you got right, the exact gap, and the one fix. It does
+  not just dump the solution.
+- That attempt updates your mastery for the topic (solid / developing / shaky),
+  logs an attempt, and feeds the heartbeat — so the agent re-plans around what you
+  actually missed.
+
+### Grounding & honesty (by design)
+- If the question has an official solution in your materials, grading is **against
+  that solution** (`graded_on: official_solution`).
+- If it doesn't, the agent grades from the topic's materials + reasoning, labels the
+  result **"no official key"**, and stays appropriately humble. It never fabricates a
+  solution.
+
+### Important: applies to newly-onboarded courses
+Solution text is captured **during onboarding**, so courses onboarded *before* this
+update (e.g. your existing ones) won't have stored solutions — their checks use the
+materials-only fallback. **Re-onboard a course** to capture solutions going forward.
+
+### Still ahead
+- Richer phases: capstone, free-choice course.
+- Adding materials to a course *after* onboarding (parked backlog).
+
+---
+
+## Phase 6 — Real-World Application (added, done to spec)
+
+Built properly this time, against the Phase 6 design: motivation, not a content dump.
+Replaces the earlier thin "Why it matters" button.
+
+### Deploy
+1. **SQL editor:** run `0012_phase6_application.sql` (after 0011). Adds the cached
+   `application_notes` table.
+2. **Redeploy `agent-coach`** — adds the `application` mode + checkpoint trigger.
+3. **Redeploy the web app.**
+
+### What it does (Phase 6 stages)
+- **Checkpoint trigger** — when a graded attempt makes a topic *understood* (solid),
+  it generates that topic's application note **once, automatically**, so it lands
+  while the concept is fresh. You can also tap **Why it matters** to generate on
+  demand.
+- **Researched + cited** — uses web search for concrete, current real-world uses and
+  **cites the real sources it found** (clickable). Paraphrased, never reproduced,
+  never fabricated.
+- **Tied to your goal** — framed around what you said you want to be able to do.
+- **Cross-course links** — looks across your *other onboarded courses' spines* and
+  surfaces only **genuine** connections (it validates the linked course is really
+  yours before showing it).
+- **Cached + revisitable** — stored as one note per concept (`application_notes`),
+  so research isn't re-run on every view (cost discipline, per the spec).
+
+### Files
+`supabase/functions/agent-coach/index.ts` (redeploy), `app/courses/[id]/AgentPanel.tsx`,
+migration `0012`.
+
+---
+
+## Where the phases stand (honest map)
+
+- **Phase 1 Onboarding** — done.
+- **Phase 2 Planning** — done: editable deadlines/capacity + a deterministic,
+  deadline-aware week-by-week schedule with a revision buffer and re-plan.
+- **Phase 3 Tracking** — done; strengthened by evidence from answer-checking.
+- **Phase 4 Daily loop / consistency** — done as heartbeat + drift intervention.
+- **Phase 5 Practice** — done (practice + answer-checking).
+- **Phase 6 Application** — done to spec (this slice).
+- **Phase 7 Capstone** — done.
+- **Phase 8 Free course** — done.
+
+---
+
+## Phase 2 — Semester Planning & Scheduling (added, done to spec)
+
+A real, **deadline-aware** week-by-week schedule — and the deadlines are yours to set,
+because school dates shift.
+
+### Deploy
+1. **SQL editor:** run `0013_phase2_scheduling.sql` (after 0012). Adds editable
+   `courses.exam_date / test_date / weight`, `student_profile.study_days_per_week`,
+   and the `schedule_items` table.
+2. **Redeploy `agent-heartbeat`** — it now prefers *this week's scheduled topics* when
+   planning, so the weekly focus lines up with the semester plan.
+3. **Redeploy the web app.**
+
+### What it does (Phase 2 stages)
+- **Editable inputs (your ask):** on the course page → **Dates & capacity**, set your
+  **exam date**, **test date**, course **importance (1–5)**, and study **hours/day +
+  days/week**. When a date shifts, change it and **Re-plan** — everything rebalances.
+- **Assessment-aware allocation `[CODE]`:** spreads the course's topics (in spine
+  order) across the weeks **before your exam**, and **reserves the last 1–2 weeks for
+  revision** instead of first-time reading. Fully deterministic — no AI guessing dates.
+- **Concrete weeks:** a week-by-week view with **this week** highlighted, the **TEST**
+  and **EXAM** weeks marked, learn-vs-revise per topic, and check-offs.
+- **Realism check `[GATE]`:** shows *hours/week needed vs your capacity* and warns when
+  you're over — so you adjust inputs and re-plan rather than getting a fantasy schedule.
+- **Re-plan from progress:** regenerating **skips topics you've already mastered**
+  (from answer-checking) and re-spreads the rest across the remaining weeks — so falling
+  behind compresses the plan instead of piling up debt.
+
+### Honest scope notes
+- Sequencing uses the **spine order** (already a sensible teaching order from
+  onboarding). The spec's AI *prerequisite* graph (`depends_on[]`) is a future add.
+- Scheduling targets the **exam** as the deadline; the test week is marked on the
+  calendar. Splitting material pre-test vs post-test is a future refinement.
+- One course at a time for now; a single merged multi-course calendar is the next step.
+
+---
+
+## Multi-course dashboard (added) · code-only, web app redeploy only
+
+Built because the real load is 8–11 courses, and the place overwhelm lives is "what do
+I do today, across everything?" The home screen is now a cross-course cockpit, not a list.
+
+- **Overwhelm guard:** a single line at the top when multiple exams fall within 2 weeks,
+  naming the nearest and telling you to protect the closest first.
+- **This week (all courses):** each course with a built schedule shows its this-week
+  task count (done/total) and how far its exam is — sorted by nearest deadline.
+- **Merged deadline calendar:** every course's test/exam dates in one sorted list with
+  "in N wks · date" — the Phase 2 "one calendar of all deadlines," finally cross-course.
+- **Course cards at a glance:** mastery progress (topics solid / total), a "quiet" flag
+  when a course has gone untouched ~4+ days, and the next deadline. Tap to open.
+- **Scales:** all of it is a handful of aggregate queries (not per-course loops), so it
+  holds up across a full courseload.
+
+Everything is deterministic from existing data — no new tables, no AI calls. UI is kept
+deliberately simple (clear sections, tappable cards) pending the later design pass; the
+nav structure (dashboard → course → schedule/agent) is the part that matters now.
+
+---
+
+## Phases 7 & 8 + cross-course allocator (added)
+
+### Deploy
+1. **SQL editor:** run `0014_phase7_8.sql` (after 0013). Adds `capstones`,
+   `capstone_milestones`, and free-course columns on `courses`.
+2. **Redeploy `agent-coach`** — adds `capstone_propose`, `capstone_plan`, and
+   `curriculum` modes.
+3. **Redeploy the web app.**
+
+### Phase 7 — Capstone (the visible end-goal)
+On each course (and surfaced on the dashboard):
+- **Propose** → the agent suggests 2–3 real capstones (paper/project) grounded in the
+  course's spine and tied to your stated motivation.
+- **Choose one** → it becomes active.
+- **Plan milestones** → 4–6 ordered milestones, each tagged with the **topics you must
+  understand first**. A milestone stays **🔒 locked until those topics are `solid`** (from
+  answer-checking) — so the capstone literally unlocks as you learn, closing the
+  motivation loop. The final milestone uses web search for real publish/showcase venues.
+
+### Phase 8 — Free-choice course (fuel)
+- **+ Free-choice course** on the dashboard → name it, say what you want to learn, set an
+  optional target date. The agent **builds you a curriculum** (modules → topics) — no
+  uploads needed — and it flows through the same plan / loop / practice / application
+  engine. No exam calendar; your **target date** drives urgency and scheduling. Always
+  available alongside school work.
+- (Practice/answer-checking on a curriculum-only course uses the materials-only path,
+  since there's no past-paper bank — honest by design.)
+
+### Cross-course allocator (the multi-course step)
+The dashboard's **Focus this week** is now one prioritised, capacity-aware list across
+**all** courses: it takes every course's scheduled-this-week work, orders it by **nearest
+deadline** (then learn-before-revise), and shows the **top N that fit your weekly hours**
+(`hrs/day × days/week ÷ ~1.5`), with the rest noted as "+N more". When exams cluster, the
+few things that matter most surface first — across the whole courseload, not per silo.
+
+---
+
+## Phase scorecard — all phases built
+1 Onboarding · 2 Planning/scheduling (dated, editable) · 3 Tracking · 4 Daily loop + drift ·
+5 Practice + answer-checking · 6 Application · 7 Capstone · 8 Free course — plus a
+multi-course dashboard and cross-course weekly allocator.
+
+### Honest remaining refinements (not blockers)
+- Capstone milestone prerequisites map within the **anchor course**; a single capstone
+  spanning multiple courses' topic graphs is a future extension.
+- The allocator prioritises and caps the weekly list across courses; a full solver that
+  re-slices each course's *semester* allocation around competing deadlines is the deeper
+  version.
+- AI **prerequisite graph** for sequencing (vs. spine order) and **generated practice**
+  when a question bank is thin remain open design choices from the spec.
+
+---
+
+## Redesign — Step 1: structure, navigation, new visual foundation (web-only)
+
+Addresses three of the four gripes at once (clutter, navigation, generic look). No
+migration, no function changes — redeploy the web app.
+
+- **New design system** (`nocturne editorial`): cooler deep ink, warm ivory, a cleaner
+  brass accent; editorial serif (Newsreader) + refined body (Hanken) + a **mono for
+  stats/labels**; lamp-glow depth, refined surfaces, scrollbars, focus rings. Same token
+  *names* (nothing breaks), fresh values.
+- **App shell** (`app/Nav.tsx`): a slim sticky top bar on every screen — wordmark → home,
+  account/sign-out. You can always get back; no more standalone islands.
+- **Tabbed course pages**: the long scroll is split into **Overview · Plan · Capstone ·
+  Materials**. Plan holds the schedule + agent; Materials holds the map, question bank,
+  and inventory. Much less overwhelming across many courses.
+- **Free-course fix**: curriculum-only courses (no upload run) no longer hit the
+  "no onboarding run" dead-end.
+
+### Still to come in the redesign
+- **Step 2 — deeper visual polish** of each panel (schedule, agent, capstone, dashboard).
+- **Step 3 — functional refinements**: one unified "what now" plan, a real *today* view,
+  add-materials/capture-solutions after onboarding, auto reading-state, optional
+  out-of-app nudges.
+
+---
+
+## Redesign — Step 2 (visual polish) + safe functional refinements (web-only)
+
+No migration, no function changes — redeploy the web app.
+
+**Visual polish**
+- **Unified mono "label" system**: every section header, status pill, kind tag, and
+  stat now uses the same tracked uppercase mono treatment — the signature detail of the
+  new look, applied consistently across dashboard, schedule, agent, capstone, and course
+  tabs. Numbers (deadlines, progress, milestones, counts) are mono for an "instrument"
+  feel.
+- Consistent cards, spacing, hover/focus states, and the refreshed nocturne palette now
+  read as one intentional system rather than per-screen variation.
+
+**Functional refinements (the low-risk, high-value ones)**
+- **Auto reading-state**: opening a note now marks that topic as *being read*
+  (`in_progress`) and logs the activity — tracking reflects what you actually do, no
+  extra taps.
+- **"Start here" today-nudge**: the single highest-priority item in the cross-course
+  Focus list is highlighted, so "what do I do first" is unmistakable.
+
+### Remaining functional refinements (deliberately a separate pass — they're features, not polish, and rushing them risks the working app)
+- **One unified "what now" plan** — have the agent work *the schedule* so there's a
+  single source of truth (today the schedule's week and the agent's plan are parallel).
+- **Add materials / capture solutions after onboarding** — upload more into an existing
+  course and re-run the relevant stages (also enables real answer-checking on older
+  courses).
+- **Out-of-app nudges** (email/WhatsApp) for drift — consistency when you're not in the
+  app.

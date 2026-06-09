@@ -4,7 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ensureSession } from "@/lib/supabase/client";
 import AgentPanel from "./AgentPanel";
+import SchedulePanel from "./SchedulePanel";
+import CapstonePanel from "./CapstonePanel";
 import type { Course, OnboardingRun, RunEvent, SourceFile, CourseTopic, Question } from "@/lib/types";
+import { effectiveDates, todayISO, daysBetween } from "@/lib/semester";
 
 const STATUS_LABEL: Record<string, string> = {
   read: "Read",
@@ -54,6 +57,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [tracking, setTracking] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState<"overview" | "plan" | "capstone" | "materials">("overview");
   const feedEnd = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -175,187 +179,191 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
     }
   }
 
-  if (loaded && !run) {
+  if (loaded && !run && course?.status !== "onboarded") {
     return (
-      <main className="mx-auto max-w-2xl px-5 py-16">
-        <Link href="/" className="text-xs text-faint hover:text-muted">← all courses</Link>
-        <p className="mt-8 text-muted">No onboarding run found for this course.</p>
+      <main className="mx-auto max-w-3xl px-5 py-16">
+        <p className="text-muted">No onboarding run found for this course.</p>
       </main>
     );
   }
 
-  return (
-    <main className="mx-auto max-w-2xl px-5 py-12 sm:py-16">
-      <Link href="/" className="text-xs text-faint hover:text-muted">← all courses</Link>
+  const onboarded = course?.status === "onboarded";
+  const { examDate } = course ? effectiveDates(course) : { examDate: null };
+  const wk = examDate && examDate >= todayISO() ? Math.max(0, Math.round(daysBetween(todayISO(), examDate) / 7)) : null;
+  const deadlineChip = wk != null ? `${course?.free_choice ? "target" : "exam"} ~${wk} wk${wk === 1 ? "" : "s"}` : null;
 
-      <header className="mt-6 mb-10">
-        <h1 className="text-3xl sm:text-4xl text-paper">{course?.title ?? "Course"}</h1>
-        {course?.code && <p className="text-sm text-faint mt-1">{course.code}</p>}
-      </header>
+  const courseMap = topics.length > 0 ? (
+    <section>
+      <h2 className="label text-gold-dim mb-4">Course map</h2>
+      <ol className="space-y-5">
+        {topics.filter((t) => t.level === 1).map((mod) => (
+          <li key={mod.id} className="rise">
+            <h3 className="text-lg text-paper">{mod.title}</h3>
+            <ul className="mt-2 space-y-1.5 border-l border-line pl-4">
+              {topics.filter((t) => t.parent_id === mod.id).map((sub) => (
+                <li key={sub.id} className="flex items-baseline justify-between gap-3 text-sm">
+                  <span className="text-paper/85">{sub.title}</span>
+                  <span className="shrink-0 font-mono text-[11px] text-faint">{sub.source_file_ids && sub.source_file_ids.length > 0 ? `${sub.source_file_ids.length} src` : "—"}</span>
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))}
+      </ol>
+    </section>
+  ) : null;
 
-      {isDone && course?.status === "review" && (
-        <div className="mb-8 rounded-xl border border-gold/30 bg-gold/5 p-5 rise">
-          <p className="text-sm text-paper">Onboarding complete. Review the map, question bank, and gaps below — then confirm.</p>
-          <button
-            onClick={confirmOnboarding}
-            className="mt-3 rounded-full bg-gold px-5 py-2 text-sm font-medium text-ink transition hover:bg-paper"
-          >
-            Looks right — finish onboarding
-          </button>
+  const questionBank = questions.length > 0 ? (
+    <section>
+      <h2 className="label text-gold-dim mb-4">Question bank</h2>
+      <div className="rounded-xl border border-line bg-surface p-5">
+        <div className="flex items-baseline gap-2">
+          <span className="font-display text-3xl text-gold">{questions.length}</span>
+          <span className="text-sm text-muted">question{questions.length === 1 ? "" : "s"} · {topicsWithQ} topic{topicsWithQ === 1 ? "" : "s"} covered · {withSolution} with solutions</span>
         </div>
-      )}
-      {course?.status === "onboarded" && (
-        <p className="mb-8 text-sm text-sage">
-          ✓ Onboarded{tracking ? ` — tracking your progress across ${tracking} topics` : ""}
-        </p>
-      )}
-
-      {course?.status === "onboarded" && <AgentPanel courseId={courseId} />}
-
-      {/* progress */}
-      <div className="mb-8">
-        <div className="flex items-center justify-between text-xs mb-2">
-          <span className="uppercase tracking-[0.2em] text-muted">
-            {isFailed ? "Stopped" : isDone ? "Inventory ready" : "Onboarding"}
-          </span>
-          <span className="text-faint">{total ? `${processed} / ${total}` : ""}</span>
-        </div>
-        <div className="h-1.5 w-full overflow-hidden rounded-full bg-raised">
-          <div
-            className={`h-full rounded-full transition-all duration-500 ${isFailed ? "bg-rust" : isDone ? "bg-sage" : "bg-gold"}`}
-            style={{ width: `${isDone ? 100 : pct}%` }}
-          />
+        <div className="mt-3 flex flex-wrap gap-2">
+          {Object.entries(qByType).sort((a, b) => b[1] - a[1]).map(([t, n]) => (
+            <span key={t} className="rounded bg-raised px-2 py-0.5 font-mono text-[11px] text-paper/80">{t} · {n}</span>
+          ))}
         </div>
       </div>
+    </section>
+  ) : null;
 
-      {/* live feed */}
-      <section className="mb-10 rounded-xl border border-line bg-surface p-5">
-        <div className="mb-3 flex items-center gap-2">
-          {!isDone && !isFailed && <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-gold" />}
-          <h2 className="text-xs uppercase tracking-[0.2em] text-muted">Activity</h2>
-        </div>
-        <ol className="max-h-72 space-y-2 overflow-y-auto pr-1">
-          {events.map((e) => (
-            <li key={e.id} className="rise text-sm leading-relaxed">
-              <span className="mr-2 text-faint tabular-nums text-[11px]">
-                {new Date(e.ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-              </span>
-              <span className={EVENT_TONE[e.kind] ?? "text-muted"}>{e.message}</span>
-            </li>
-          ))}
-          <div ref={feedEnd} />
-        </ol>
-      </section>
+  const coverage = (isDone || onboarded) && l2.length > 0 ? (
+    <section>
+      <h2 className="label text-gold-dim mb-4">Coverage &amp; gaps</h2>
+      <div className="space-y-3">
+        <GapRow tone={topicsNoReading.length ? "warn" : "ok"} label="Topics with no reading material" count={topicsNoReading.length} items={topicsNoReading.map((t) => t.title)} />
+        <GapRow tone={topicsNoQuestions.length ? "warn" : "ok"} label="Topics with no practice questions" count={topicsNoQuestions.length} items={topicsNoQuestions.map((t) => t.title)} />
+        <GapRow tone={untaggedCount ? "info" : "ok"} label="Questions not matched to a topic" count={untaggedCount} />
+        <GapRow tone={unreadableCount ? "info" : "ok"} label="Files that couldn't be read" count={unreadableCount} />
+      </div>
+    </section>
+  ) : null;
 
-      {/* course map */}
-      {topics.length > 0 && (
-        <section className="mb-10">
-          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Course map</h2>
-          <ol className="space-y-5">
-            {topics.filter((t) => t.level === 1).map((mod) => (
-              <li key={mod.id} className="rise">
-                <h3 className="text-lg text-paper">{mod.title}</h3>
-                <ul className="mt-2 space-y-1.5 border-l border-line pl-4">
-                  {topics.filter((t) => t.parent_id === mod.id).map((sub) => (
-                    <li key={sub.id} className="flex items-baseline justify-between gap-3 text-sm">
-                      <span className="text-paper/85">{sub.title}</span>
-                      <span className="shrink-0 text-[11px] text-faint">
-                        {sub.source_file_ids && sub.source_file_ids.length > 0
-                          ? `${sub.source_file_ids.length} source${sub.source_file_ids.length > 1 ? "s" : ""}`
-                          : "—"}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
-
-      {/* question bank */}
-      {questions.length > 0 && (
-        <section className="mb-10">
-          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Question bank</h2>
-          <div className="rounded-xl border border-line bg-surface p-5">
-            <div className="flex items-baseline gap-2">
-              <span className="font-display text-3xl text-gold">{questions.length}</span>
-              <span className="text-sm text-muted">
-                question{questions.length === 1 ? "" : "s"} · {topicsWithQ} topic{topicsWithQ === 1 ? "" : "s"} covered · {withSolution} with solutions
-              </span>
+  const inventory = files.length > 0 ? (
+    <section>
+      <h2 className="label text-gold-dim mb-4">Inventory</h2>
+      <div className="space-y-6">
+        {order.filter((k) => groups[k]?.length).map((k) => (
+          <div key={k}>
+            <div className="mb-2 flex items-center gap-2">
+              <span className={`text-sm font-medium ${STATUS_TONE[k]}`}>{STATUS_LABEL[k]}</span>
+              <span className="font-mono text-xs text-faint">({groups[k].length})</span>
             </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {Object.entries(qByType).sort((a, b) => b[1] - a[1]).map(([t, n]) => (
-                <span key={t} className="rounded bg-raised px-2 py-0.5 text-[11px] text-paper/80">
-                  {t} · {n}
-                </span>
+            <ul className="space-y-2">
+              {groups[k].map((f) => (
+                <li key={f.id} className="rounded-lg border border-line/60 bg-raised/40 px-3 py-2">
+                  <div className="flex items-baseline justify-between gap-3">
+                    <span className="truncate text-sm text-paper/90">{f.original_path.split("/").pop()}</span>
+                    <span className="shrink-0 font-mono text-[11px] text-faint">{f.page_count ? `${f.page_count}p` : ""}{f.note && k !== "read" ? ` · ${f.note}` : ""}</span>
+                  </div>
+                  {f.category && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                      <span className="label rounded bg-gold/10 px-1.5 py-0.5 text-gold-dim">{CATEGORY_LABEL[f.category] ?? f.category}</span>
+                      {f.contains_questions && <span className="text-[10px] text-sage">has questions</span>}
+                      {typeof f.category_confidence === "number" && f.category_confidence > 0 && f.category_confidence < 0.6 && <span className="text-[10px] text-gold">check this</span>}
+                    </div>
+                  )}
+                  {f.summary && <p className="mt-1 text-xs leading-snug text-muted">{f.summary}</p>}
+                </li>
               ))}
-            </div>
+            </ul>
           </div>
-        </section>
-      )}
+        ))}
+      </div>
+    </section>
+  ) : null;
 
-      {/* coverage */}
-      {isDone && l2.length > 0 && (
-        <section className="mb-10">
-          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Coverage & gaps</h2>
-          <div className="space-y-3">
-            <GapRow tone={topicsNoReading.length ? "warn" : "ok"}
-              label="Topics with no reading material"
-              count={topicsNoReading.length}
-              items={topicsNoReading.map((t) => t.title)} />
-            <GapRow tone={topicsNoQuestions.length ? "warn" : "ok"}
-              label="Topics with no practice questions"
-              count={topicsNoQuestions.length}
-              items={topicsNoQuestions.map((t) => t.title)} />
-            <GapRow tone={untaggedCount ? "info" : "ok"}
-              label="Questions not matched to a topic" count={untaggedCount} />
-            <GapRow tone={unreadableCount ? "info" : "ok"}
-              label="Files that couldn't be read" count={unreadableCount} />
+  const activity = (
+    <section className="rounded-xl border border-line bg-surface p-5">
+      <div className="mb-3 flex items-center gap-2">
+        {!isDone && !isFailed && <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-gold" />}
+        <h2 className="label text-gold-dim">Activity</h2>
+      </div>
+      <ol className="max-h-72 space-y-2 overflow-y-auto pr-1">
+        {events.map((e) => (
+          <li key={e.id} className="rise text-sm leading-relaxed">
+            <span className="mr-2 font-mono text-[11px] text-faint">{new Date(e.ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+            <span className={EVENT_TONE[e.kind] ?? "text-muted"}>{e.message}</span>
+          </li>
+        ))}
+        <div ref={feedEnd} />
+      </ol>
+    </section>
+  );
+
+  const progress = (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <span className="label text-faint">{isFailed ? "Stopped" : isDone ? "Inventory ready" : "Onboarding"}</span>
+        <span className="font-mono text-[11px] text-faint">{total ? `${processed} / ${total}` : ""}</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-raised">
+        <div className={`h-full rounded-full transition-all duration-500 ${isFailed ? "bg-rust" : isDone ? "bg-sage" : "bg-gold"}`} style={{ width: `${isDone ? 100 : pct}%` }} />
+      </div>
+    </div>
+  );
+
+  const TABS = [["overview", "Overview"], ["plan", "Plan"], ["capstone", "Capstone"], ["materials", "Materials"]] as const;
+
+  return (
+    <main className="mx-auto max-w-3xl px-5 pb-24 pt-6 sm:pt-8">
+      <header className="mb-6">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="font-display text-3xl leading-tight text-paper sm:text-4xl">{course?.title ?? "Course"}</h1>
+            <p className="mt-1 text-xs text-faint">{course?.free_choice ? "Free-choice course" : course?.code || ""}</p>
           </div>
-        </section>
-      )}
+          <span className={`label shrink-0 rounded-full px-2.5 py-1 ${onboarded ? "bg-sage/15 text-sage" : course?.status === "review" ? "bg-gold/15 text-gold" : "bg-raised text-muted"}`}>
+            {onboarded ? "onboarded" : course?.status === "review" ? "review" : isFailed ? "stopped" : "building"}
+          </span>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2 font-mono text-[11px]">
+          {l2.length > 0 && <span className="rounded bg-raised px-2 py-1 text-muted">{l2.length} topics</span>}
+          {questions.length > 0 && <span className="rounded bg-raised px-2 py-1 text-muted">{questions.length} questions</span>}
+          {deadlineChip && <span className="rounded bg-raised px-2 py-1 text-muted">{deadlineChip}</span>}
+        </div>
+      </header>
 
-      {/* inventory */}
-      {files.length > 0 && (
-        <section>
-          <h2 className="mb-4 text-xs uppercase tracking-[0.2em] text-muted">Inventory</h2>
-          <div className="space-y-6">
-            {order.filter((k) => groups[k]?.length).map((k) => (
-              <div key={k}>
-                <div className="mb-2 flex items-center gap-2">
-                  <span className={`text-sm font-medium ${STATUS_TONE[k]}`}>{STATUS_LABEL[k]}</span>
-                  <span className="text-xs text-faint">({groups[k].length})</span>
-                </div>
-                <ul className="space-y-2">
-                  {groups[k].map((f) => (
-                    <li key={f.id} className="rounded-lg border border-line/60 bg-raised/40 px-3 py-2">
-                      <div className="flex items-baseline justify-between gap-3">
-                        <span className="truncate text-sm text-paper/90">{f.original_path.split("/").pop()}</span>
-                        <span className="shrink-0 text-[11px] text-faint">
-                          {f.page_count ? `${f.page_count}p` : ""}
-                          {f.note && k !== "read" ? ` · ${f.note}` : ""}
-                        </span>
-                      </div>
-                      {f.category && (
-                        <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                          <span className="rounded bg-gold/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-gold-dim">
-                            {CATEGORY_LABEL[f.category] ?? f.category}
-                          </span>
-                          {f.contains_questions && <span className="text-[10px] text-sage">has questions</span>}
-                          {typeof f.category_confidence === "number" && f.category_confidence > 0 && f.category_confidence < 0.6 && (
-                            <span className="text-[10px] text-gold">check this</span>
-                          )}
-                        </div>
-                      )}
-                      {f.summary && <p className="mt-1 text-xs leading-snug text-muted">{f.summary}</p>}
-                    </li>
-                  ))}
-                </ul>
-              </div>
+      {onboarded ? (
+        <>
+          <nav className="mb-8 flex gap-1 border-b border-line">
+            {TABS.map(([k, label]) => (
+              <button key={k} onClick={() => setTab(k)} className={`relative px-3 py-2 text-sm transition ${tab === k ? "text-paper" : "text-faint hover:text-muted"}`}>
+                {label}
+                {tab === k && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded bg-gold" />}
+              </button>
             ))}
-          </div>
-        </section>
+          </nav>
+
+          {tab === "overview" && (
+            <div className="space-y-8 rise">
+              {tracking ? <p className="text-sm text-sage">✓ Tracking your progress across {tracking} topics.</p> : null}
+              {coverage}
+              <p className="text-sm text-muted">Head to <button onClick={() => setTab("plan")} className="text-gold-dim underline-offset-2 hover:underline">Plan</button> for your weekly focus and practice, or <button onClick={() => setTab("capstone")} className="text-gold-dim underline-offset-2 hover:underline">Capstone</button> for the end-goal this builds toward.</p>
+            </div>
+          )}
+          {tab === "plan" && (<div className="rise"><SchedulePanel courseId={courseId} /><AgentPanel courseId={courseId} /></div>)}
+          {tab === "capstone" && (<div className="rise"><CapstonePanel courseId={courseId} /></div>)}
+          {tab === "materials" && (<div className="space-y-10 rise">{courseMap}{questionBank}{inventory}</div>)}
+        </>
+      ) : (
+        <div className="space-y-10">
+          {isDone && course?.status === "review" && (
+            <div className="rounded-xl border border-gold/30 bg-gold/5 p-5 rise">
+              <p className="text-sm text-paper">Onboarding complete. Check the map, question bank, and gaps — then confirm.</p>
+              <button onClick={confirmOnboarding} className="mt-3 rounded-full bg-gold px-5 py-2 text-sm font-medium text-ink transition hover:bg-paper">Looks right — finish onboarding</button>
+            </div>
+          )}
+          {progress}
+          {activity}
+          {courseMap}
+          {questionBank}
+          {coverage}
+          {inventory}
+        </div>
       )}
     </main>
   );

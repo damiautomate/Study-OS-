@@ -90,24 +90,53 @@ async function doHeartbeat(userId: string, courseId: string, reason: string) {
     return `- ${t.title} [read:${rs}, understanding:${us}] (questions:${t.question_count}, materials:${t.source_count})`;
   }).join("\n");
 
-  const touched = (mastery ?? []).map((m: any) => m.last_touched).filter(Boolean).sort();
-  const lastTouched = touched.length ? touched[touched.length - 1] : null;
-  const daysSince = lastTouched ? Math.floor((Date.now() - new Date(lastTouched).getTime()) / 86400000) : null;
+  // engagement signals
+  const sinceISO = new Date(Date.now() - 14 * 86400000).toISOString();
+  const { data: logs } = await db.from("study_log")
+    .select("created_at").eq("user_id", userId).eq("course_id", courseId).gte("created_at", sinceISO);
+  const fromMastery = (mastery ?? []).map((m: any) => m.last_touched).filter(Boolean).sort();
+  const logTimes = (logs ?? []).map((l: any) => l.created_at).sort();
+  const lastActivity = logTimes.length ? logTimes[logTimes.length - 1] : (fromMastery.length ? fromMastery[fromMastery.length - 1] : null);
+  const daysSince = lastActivity ? Math.floor((Date.now() - new Date(lastActivity).getTime()) / 86400000) : null;
+  const dayKey = (iso: string) => new Date(iso).toISOString().slice(0, 10);
+  const activeDays7 = new Set((logs ?? []).filter((l: any) => new Date(l.created_at).getTime() > Date.now() - 7 * 86400000).map((l: any) => dayKey(l.created_at))).size;
+
+  // current plan adherence
+  const { data: activePlan } = await db.from("study_plans")
+    .select("id, created_at").eq("user_id", userId).eq("course_id", courseId).eq("active", true)
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  let adherence = "no active plan yet";
+  if (activePlan) {
+    const { data: pis } = await db.from("plan_items").select("done").eq("plan_id", activePlan.id);
+    const total = (pis ?? []).length, doneN = (pis ?? []).filter((p: any) => p.done).length;
+    const ageDays = Math.floor((Date.now() - new Date(activePlan.created_at).getTime()) / 86400000);
+    adherence = `${doneN}/${total} items done, plan is ${ageDays} day(s) old`;
+  }
 
   const wToTest = weeksUntil(course.test_window);
   const wToExam = weeksUntil(course.exam_window);
 
+  // this week's topics from the semester schedule (Phase 2), if one exists
+  const { data: sched } = await db.from("schedule_items")
+    .select("topic_id, kind").eq("user_id", userId).eq("course_id", courseId).eq("week_index", 1);
+  const titleById = new Map((topics ?? []).map((t: any) => [t.id, t.title]));
+  const scheduledThisWeek = (sched ?? [])
+    .map((s: any) => `${titleById.get(s.topic_id) ?? ""}${s.kind === "revise" ? " (revise)" : ""}`)
+    .filter((x: string) => x.trim());
+
   const prompt =
-    "You are the study agent for ONE student in ONE university course. Your goal: keep them moving toward genuine understanding by exam time — focused, consistent, and NOT overloaded or burnt out. Be specific to this student and exactly where they are.\n\n" +
+    "You are the study agent for ONE student in ONE university course. Your goal: keep them moving toward genuine understanding by exam time — focused, consistent, and NOT overloaded or burnt out. You also act PROACTIVELY: if they've gone quiet or are slipping, you reach out first. Be specific to this student and exactly where they are.\n\n" +
     `STUDENT\nGoal: ${profile?.semester_goal ?? "—"}\nWants to be able to: ${profile?.motivation ?? "—"}\nResponds best to: ${profile?.accountability_style ?? "—"}\nStudy hours/day: ${profile?.study_hours_per_day ?? "—"}\nHas struggled with: ${(profile?.past_struggles ?? []).join("; ") || "—"}\n\n` +
-    `COURSE: ${course.title}\nTime left: ${wToTest ?? "?"} weeks to tests, ${wToExam ?? "?"} weeks to exams.\nLast studied: ${daysSince === null ? "not yet" : daysSince + " days ago"}.\nLast note you sent: ${lastMsgs?.[0]?.body ?? "none"}\n\n` +
+    `COURSE: ${course.title}\nTime left: ${wToTest ?? "?"} weeks to tests, ${wToExam ?? "?"} weeks to exams.\n\n` +
+    `ENGAGEMENT\nLast studied: ${daysSince === null ? "not started yet" : daysSince + " day(s) ago"}.\nActive ${activeDays7} of the last 7 days.\nCurrent plan: ${adherence}.\nLast note you sent: ${lastMsgs?.[0]?.body ?? "none"}\n\n` +
     `TOPICS (their current state):\n${topicLines}\n\n` +
+    (scheduledThisWeek.length ? `THIS WEEK IN THEIR SEMESTER SCHEDULE (prefer these unless they're behind on something more urgent):\n- ${scheduledThisWeek.join("\n- ")}\n\n` : "") +
     'Decide what they need RIGHT NOW. Return ONLY JSON, no fences:\n' +
     '{"situation":"1-2 sentence read of where they stand","actions":[ ... ]}\n' +
     "Allowed actions (use 1-2, choose what matters most):\n" +
-    '- {"type":"set_plan","items":[{"topic":"EXACT topic title from the list","reason":"why this, one line"}]} — 3 to 6 topics, ordered. Prioritise not-yet-understood topics and what\'s urgent given the timeline. Pick topics ONLY from the list above.\n' +
-    '- {"type":"message_student","body":"a short, human note matched to how they like to be pushed; never shaming; if they are behind near exams, help them cut scope rather than pile on"}\n' +
-    '- {"type":"hold","reason":"why nothing is needed right now"}';
+    '- {"type":"set_plan","items":[{"topic":"EXACT topic title from the list","reason":"why this, one line"}]} — 3 to 6 topics, ordered, from the list ONLY. If they are overwhelmed or behind, set a SHORTER plan, not a longer one.\n' +
+    '- {"type":"message_student","body":"a short, human note matched to how they like to be pushed; never shaming"} — use this to PROACTIVELY re-engage: if quiet 3+ days or adherence is low, reach out with ONE tiny, concrete re-entry step (e.g. "just 15 minutes on X today"). If they have been consistent, acknowledge it briefly. Never repeat your last note.\n' +
+    '- {"type":"hold","reason":"why nothing is needed"} — use only if they were active very recently and are on track.';
 
   let parsed: any;
   try {
@@ -151,9 +180,10 @@ async function sweep() {
   for (const c of courses ?? []) {
     if (done >= SWEEP_LIMIT) break;
     const since = new Date(Date.now() - SWEEP_GAP_HOURS * 3600000).toISOString();
-    const { count } = await db.from("study_plans").select("id", { count: "exact", head: true })
+    // run a beat if the agent hasn't done anything for this course recently
+    const { count } = await db.from("agent_actions").select("id", { count: "exact", head: true })
       .eq("course_id", c.id).gt("created_at", since);
-    if ((count ?? 0) > 0) continue; // had a recent beat
+    if ((count ?? 0) > 0) continue; // checked in recently
     try { await doHeartbeat(c.user_id, c.id, "daily"); done++; } catch (_) { /* keep sweeping */ }
   }
 }
