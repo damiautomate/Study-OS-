@@ -3,6 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ensureSession } from "@/lib/supabase/client";
 
+function errMsg(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try { return JSON.stringify(e); } catch { return "Something went wrong."; }
+}
+
 export default function AddMaterials({ courseId, onMerged }: { courseId: string; onMerged?: () => void }) {
   const supaRef = useRef<any>(null);
   const [files, setFiles] = useState<File[]>([]);
@@ -59,10 +65,10 @@ export default function AddMaterials({ courseId, onMerged }: { courseId: string;
         body: JSON.stringify({ courseId, files: uploaded }),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Could not start the merge.");
+      if (!res.ok) throw new Error(typeof json.error === "string" ? json.error : JSON.stringify(json.error ?? "Could not start the merge."));
       setRunId(json.runId);
     } catch (e) {
-      setError((e as Error).message);
+      setError(errMsg(e));
       setBusy(false); setStatus("");
     }
   }

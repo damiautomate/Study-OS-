@@ -817,3 +817,21 @@ attach to the generated topics.)
 - Page-number accuracy on born-digital PDFs is exact (extractor-counted); on OCR'd
   scans it relies on the model following the numbered-marker instruction — verified by
   prompt design, worth eyeballing on your first scanned textbook.
+
+---
+
+## Hotfix — upload errors, duplicate courses, stuck onboarding diagnosis
+
+- **Real error messages**: the "[object Object]" failure now shows the actual error
+  (all upload/create flows stringify unknown errors properly).
+- **No more ghost duplicates**: if run creation fails, /api/courses deletes the course
+  it just created, so retrying can't leave duplicate "building" courses behind.
+- **Reliable worker kick**: /api/courses and /api/augment now give the worker
+  fire-and-forget kick up to ~1.5s to actually leave the building before the
+  serverless function exits (previously it could be killed before sending).
+- **Deployment verification**: the worker now answers a plain **GET** at its URL with
+  `{ ok: true, worker: "v7-pages" }` — open the function URL in a browser to confirm
+  the new version is the one actually running. The first activity line also shows the
+  version: "Opening your upload… (worker v7-pages)".
+- The course page shows a hint when a run sits with zero activity (worker likely not
+  deployed/booting).

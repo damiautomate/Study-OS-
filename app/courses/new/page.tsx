@@ -5,6 +5,12 @@ import { useRouter } from "next/navigation";
 import { ensureSession } from "@/lib/supabase/client";
 import { describeWindows } from "@/lib/semester";
 
+function errMsg(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try { return JSON.stringify(e); } catch { return "Something went wrong."; }
+}
+
 export default function NewCourse() {
   const router = useRouter();
   const [title, setTitle] = useState("");
@@ -48,11 +54,11 @@ export default function NewCourse() {
         body: JSON.stringify({ title: title.trim(), code: code.trim(), semesterStart, uploadPaths: uploaded }),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Something went wrong.");
+      if (!res.ok) throw new Error(typeof json.error === "string" ? json.error : JSON.stringify(json.error ?? "Something went wrong."));
 
       router.push(`/courses/${json.courseId}`);
     } catch (e) {
-      setError((e as Error).message);
+      setError(errMsg(e));
       setBusy(false);
       setStatus("");
     }

@@ -283,6 +283,9 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
         {!isDone && !isFailed && <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-gold" />}
         <h2 className="label text-gold-dim">Activity</h2>
       </div>
+      {events.length === 0 && !isDone && !isFailed && (
+        <p className="mb-2 text-xs text-muted">Waiting for the worker… if nothing appears here within a minute, the onboarding-worker Edge Function likely isn&apos;t deployed correctly — check its Logs in Supabase.</p>
+      )}
       <ol className="max-h-72 space-y-2 overflow-y-auto pr-1">
         {events.map((e) => (
           <li key={e.id} className="rise text-sm leading-relaxed">

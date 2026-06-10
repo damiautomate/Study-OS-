@@ -34,6 +34,8 @@ const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
 const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
 
+const WORKER_VERSION = "v7-pages";
+
 const OCR_PROMPT =
   "Transcribe all readable text from this document verbatim, preserving reading order. " +
   "Include text from tables, figures, and handwriting where legible. " +
@@ -243,7 +245,7 @@ async function doExtract(job: any) {
   if (!run) throw new Error("run not found");
 
   await db.from("onboarding_runs").update({ status: "running", stage: "extract", updated_at: new Date().toISOString() }).eq("id", runId);
-  await logEvent(runId, "stage", "Opening your upload…");
+  await logEvent(runId, "stage", `Opening your upload… (worker ${WORKER_VERSION})`);
 
   // sources: legacy single zip_path, and/or a list of directly-uploaded files
   const sources: { path: string; name: string }[] = [];
@@ -918,6 +920,9 @@ async function tick(): Promise<{ worked: boolean }> {
 }
 
 Deno.serve(async (req) => {
+  if (req.method === "GET") {
+    return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION }), { headers: { "Content-Type": "application/json" } });
+  }
   if (req.headers.get("x-worker-secret") !== WORKER_SECRET) return new Response("forbidden", { status: 403 });
   const { worked } = await tick();
   if (worked) fireNextTick();

@@ -6,6 +6,12 @@ import Link from "next/link";
 import { ensureSession } from "@/lib/supabase/client";
 import { todayISO } from "@/lib/semester";
 
+function errMsg(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  try { return JSON.stringify(e); } catch { return "Something went wrong."; }
+}
+
 export default function NewFreeCourse() {
   const router = useRouter();
   const [title, setTitle] = useState("");
@@ -45,7 +51,7 @@ export default function NewFreeCourse() {
       }
       router.push(`/courses/${id}`); // give up waiting; the page will catch up
     } catch (e) {
-      setError((e as Error).message);
+      setError(errMsg(e));
       setPhase("form");
     }
   }
