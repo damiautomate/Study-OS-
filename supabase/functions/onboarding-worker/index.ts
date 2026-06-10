@@ -34,7 +34,11 @@ const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
 const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
 
-const WORKER_VERSION = "v7-pages";
+const WORKER_VERSION = "v8-bigfile";
+// Edge functions get ~2s CPU / 256MB — never load big files into memory.
+const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "45");
+const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
+const HASH_MAX_BYTES = Number(Deno.env.get("HASH_MAX_MB") ?? "20") * 1024 * 1024;
 
 const OCR_PROMPT =
   "Transcribe all readable text from this document verbatim, preserving reading order. " +
@@ -249,10 +253,15 @@ async function doExtract(job: any) {
   await logEvent(runId, "stage", `Opening your upload… (worker ${WORKER_VERSION})`);
 
   // sources: legacy single zip_path, and/or a list of directly-uploaded files
-  const sources: { path: string; name: string }[] = [];
-  if (run.zip_path) sources.push({ path: run.zip_path, name: String(run.zip_path).split("/").pop() ?? "upload.zip" });
+  const sources: { path: string; name: string; size?: number | null; mime?: string | null }[] = [];
+  if (run.zip_path) sources.push({ path: run.zip_path, name: String(run.zip_path).split("/").pop() ?? "upload.zip", size: null, mime: null });
   if (Array.isArray(run.upload_paths)) {
-    for (const u of run.upload_paths) if (u && typeof u.path === "string") sources.push({ path: u.path, name: typeof u.name === "string" ? u.name : u.path.split("/").pop() });
+    for (const u of run.upload_paths) if (u && typeof u.path === "string") sources.push({
+      path: u.path,
+      name: typeof u.name === "string" ? u.name : u.path.split("/").pop(),
+      size: typeof u.size === "number" ? u.size : null,
+      mime: typeof u.mime === "string" && u.mime ? u.mime : null,
+    });
   }
   if (sources.length === 0) throw new Error("nothing to extract");
 
@@ -264,14 +273,27 @@ async function doExtract(job: any) {
   let idx = 0, dupes = 0, registered = 0;
   const readJobs: any[] = [];
 
+  async function registerOversize(originalName: string, sizeBytes: number | null, mime: string | null, existingPath: string | null) {
+    idx++;
+    const mb = sizeBytes ? Math.round(sizeBytes / (1024 * 1024)) : null;
+    await db.from("source_files").insert({
+      course_id: run.course_id, run_id: runId, original_path: originalName,
+      storage_path: existingPath, content_hash: null, mime_type: mime ?? detectMime(originalName, new Uint8Array(0)),
+      size_bytes: sizeBytes,
+      read_status: "unsupported",
+      note: `too large for processing (${mb ?? "?"}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
+    });
+    await logEvent(runId, "warning", `Skipped (too large): ${originalName}${mb ? ` — ${mb}MB` : ""}`);
+  }
+
   async function registerFile(originalName: string, bytes: Uint8Array, existingPath: string | null) {
     idx++;
-    const hash = await sha256(bytes);
+    const hash = bytes.length <= HASH_MAX_BYTES ? await sha256(bytes) : null;
     const mime = detectMime(originalName, bytes);
-    const isDup = seen.has(hash);
+    const isDup = hash ? seen.has(hash) : false;
     let storagePath: string | null = existingPath;
     if (!isDup) {
-      seen.set(hash, originalName);
+      if (hash) seen.set(hash, originalName);
       if (!existingPath) {
         const safeName = originalName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
         storagePath = `extracted/${runId}/${idx}-${safeName}`;
@@ -285,7 +307,7 @@ async function doExtract(job: any) {
       storage_path: storagePath, content_hash: hash, mime_type: mime,
       size_bytes: bytes.length,
       read_status: isDup ? "duplicate" : "pending",
-      note: isDup ? `duplicate of ${seen.get(hash)}` : null,
+      note: isDup ? `duplicate of ${hash ? seen.get(hash) : ""}` : null,
     }).select("id").single();
     if (insErr) throw new Error(`db insert failed: ${insErr.message}`);
     if (!isDup) { readJobs.push({ run_id: runId, stage: "read", file_id: inserted!.id }); registered++; }
@@ -293,9 +315,14 @@ async function doExtract(job: any) {
 
   let totalBytes = 0;
   for (const src of sources) {
+    const isZip = /\.zip$/i.test(src.name) || /\.zip$/i.test(src.path);
+    // decide from the client-declared size BEFORE downloading — never pull a huge file into memory
+    if (!isZip && src.size != null && src.size > MAX_FILE_BYTES) {
+      await registerOversize(src.name, src.size, src.mime ?? null, src.path);
+      continue;
+    }
     const dl = await db.storage.from(BUCKET).download(src.path);
     if (dl.error || !dl.data) throw new Error(`could not download ${src.name}: ${dl.error?.message}`);
-    const isZip = /\.zip$/i.test(src.name) || /\.zip$/i.test(src.path);
 
     if (isZip) {
       const zipReader = new ZipReader(new BlobReader(dl.data));
@@ -307,12 +334,21 @@ async function doExtract(job: any) {
       if (totalBytes > MAX_TOTAL_UNCOMPRESSED) { await zipReader.close(); throw new Error("upload too large once unzipped"); }
       await logEvent(runId, "info", `Unzipped ${src.name} — ${files.length} files found`);
       for (const entry of files) {
+        if ((entry.uncompressedSize ?? 0) > MAX_FILE_BYTES) {
+          await registerOversize(entry.filename, entry.uncompressedSize ?? null, detectMime(entry.filename, new Uint8Array(0)), null);
+          continue;
+        }
         const bytes: Uint8Array = await entry.getData!(new Uint8ArrayWriter());
         await registerFile(entry.filename, bytes, null);
       }
       await zipReader.close();
     } else {
       const bytes = new Uint8Array(await dl.data.arrayBuffer());
+      if (bytes.length > MAX_FILE_BYTES) {
+        // no declared size (or it lied) — verified after download as a fallback
+        await registerOversize(src.name, bytes.length, src.mime ?? null, src.path);
+        continue;
+      }
       totalBytes += bytes.length;
       if (totalBytes > MAX_TOTAL_UNCOMPRESSED) throw new Error("upload too large");
       // direct upload already sits in storage — reuse its path, no copy
@@ -343,6 +379,18 @@ async function doRead(job: any) {
   if (!file || file.read_status !== "pending") {
     await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
     if (file) await maybeFinalize(runId, file.course_id);
+    return;
+  }
+
+  // safety net: never pull an oversize file into worker memory (kills the function)
+  if (typeof file.size_bytes === "number" && file.size_bytes > MAX_FILE_BYTES) {
+    await db.from("source_files").update({
+      read_status: "unsupported",
+      note: `too large for processing (${Math.round(file.size_bytes / (1024 * 1024))}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
+    }).eq("id", file.id);
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "warning", `Skipped (too large): ${file.original_path}`);
+    await maybeFinalize(runId, file.course_id);
     return;
   }
 

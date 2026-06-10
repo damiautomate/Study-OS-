@@ -54,7 +54,7 @@ export default function AddMaterials({ courseId, onMerged }: { courseId: string;
         if (sizeErr) throw new Error(sizeErr);
       }
       const batch = crypto.randomUUID();
-      const uploaded: { path: string; name: string }[] = [];
+      const uploaded: { path: string; name: string; size: number; mime: string | null }[] = [];
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
         setStatus(`Uploading ${i + 1}/${files.length} — ${f.name}… 0%`);
@@ -62,7 +62,7 @@ export default function AddMaterials({ courseId, onMerged }: { courseId: string;
         const path = `${uid}/aug-${batch}/${i + 1}-${safe}`;
         await uploadWithProgress(supabase, "course-uploads", path, f,
           (pct) => setStatus(`Uploading ${i + 1}/${files.length} — ${f.name}… ${pct}%`));
-        uploaded.push({ path, name: f.name });
+        uploaded.push({ path, name: f.name, size: f.size, mime: f.type || null });
       }
       setStatus("Merging into your course…");
       const res = await fetch("/api/augment", {

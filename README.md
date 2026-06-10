@@ -867,3 +867,37 @@ attach to the generated topics.)
 **What cannot be tested from here (requires your live keys):** the actual AI pipeline
 runs against your Supabase + Anthropic account. The version ping + versioned first
 activity line exist precisely so you can confirm the deployed worker in seconds.
+
+---
+
+## Hotfix v8-bigfile — the WORKER_RESOURCE_LIMIT (546) crash loop
+
+**Diagnosis (from your Edge Function logs):** HTTP 546 `WORKER_RESOURCE_LIMIT` —
+Supabase killed the worker for exceeding free-tier CPU/memory (~2s CPU / 256MB). The
+extract stage loaded each file fully into memory and SHA-256 hashed it; a ~100MB
+solution-manual PDF blows that instantly. Because the function died mid-job, the job
+never recorded failure — it was reclaimed as stale and retried forever (the repeating
+546s in your logs are the cron re-trying the same doomed job).
+
+**Fixes (worker `v8-bigfile`):**
+- Uploads now declare `size` + `mime` from the browser, so the worker can decide
+  **without downloading**: direct files over `MAX_FILE_MB` (default 45, env-tunable)
+  are registered as `unsupported` with a clear note ("too large — compress, split into
+  chapters, or raise MAX_FILE_MB") and **never enter memory**. The rest of the course
+  processes normally.
+- Zip entries are size-checked via their header **before** decompression.
+- A post-download fallback catches undeclared sizes; `doRead` has the same guard for
+  any legacy rows.
+- Hashing (dedupe) only runs on files ≤ 20MB (`HASH_MAX_MB`) — big files skip the
+  CPU-heavy hash instead of dying on it.
+- Version ping now reports `v8-bigfile`.
+
+**Recovery steps:**
+1. Redeploy `onboarding-worker` with this file; confirm GET shows
+   `{"ok":true,"worker":"v8-bigfile"}`.
+2. The stuck job resumes automatically (cron) — this time it will skip the oversize
+   PDF with a visible "Skipped (too large)" event and finish the rest of the course.
+3. Delete the duplicate "Circuits and Systems II" course rows in Table Editor.
+4. For the solution manual itself: compress it, split it into chapter PDFs (best — the
+   chapter-relevance feature then maps them precisely), or raise `MAX_FILE_MB` (worker
+   env) *and* your Storage upload limit — noting bigger files cost more worker headroom.
