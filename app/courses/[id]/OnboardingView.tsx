@@ -282,6 +282,14 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
       <div className="mb-3 flex items-center gap-2">
         {!isDone && !isFailed && <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-gold" />}
         <h2 className="label text-gold-dim">Activity</h2>
+        {!isDone && (
+          <button
+            onClick={async () => { try { await fetch("/api/kick", { method: "POST" }); } catch { /* */ } }}
+            className="ml-auto rounded-full border border-line px-2.5 py-1 font-mono text-[10px] text-muted transition hover:border-gold hover:text-paper"
+            title="If progress stalls, this nudges the worker to pick the queue back up">
+            resume ↻
+          </button>
+        )}
       </div>
       {events.length === 0 && !isDone && !isFailed && (
         <p className="mb-2 text-xs text-muted">Waiting for the worker… if nothing appears here within a minute, the onboarding-worker Edge Function likely isn&apos;t deployed correctly — check its Logs in Supabase.</p>

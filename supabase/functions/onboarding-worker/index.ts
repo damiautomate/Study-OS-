@@ -11,9 +11,8 @@
 // =============================================================
 
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { ZipReader, BlobReader, Uint8ArrayWriter } from "npm:@zip.js/zip.js@2.7.45";
-import { getDocumentProxy, extractText } from "npm:unpdf@0.12.1";
-import { PDFDocument } from "npm:pdf-lib@1.17.1";
+// Heavy libraries are lazy-loaded inside the stages that need them — keeping the
+// baseline memory of every invocation small (Edge functions have tight limits).
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -34,17 +33,17 @@ const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
 const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
 
-const WORKER_VERSION = "v9-chunked";
+const WORKER_VERSION = "v12-tick";
 // Edge functions get ~2s CPU / 256MB — never load big files into memory.
-const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "45");
+const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "25");
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
 const HASH_MAX_BYTES = Number(Deno.env.get("HASH_MAX_MB") ?? "20") * 1024 * 1024;
 
 const OCR_PROMPT =
-  "Transcribe all readable text from this document verbatim, preserving reading order. " +
+  "Transcribe ONLY pages {FIRST_PAGE} through {LAST_PAGE} of this document, verbatim, preserving reading order. Ignore all other pages completely. " +
   "Include text from tables, figures, and handwriting where legible. " +
-  "Before each page's content, output a line containing exactly [[PAGE k]] using the page's real number in the whole document; " +
-  "the first page of this excerpt is page {FIRST_PAGE}. Output ONLY the markers and transcribed text, no commentary.";
+  "Before each page's content, output a line containing exactly [[PAGE k]] where k is that page's real number in the whole document. " +
+  "Output ONLY the markers and transcribed text, no commentary.";
 
 const CATEGORIES = ["slides", "textbook", "notes", "assignment", "test", "exam", "solutions", "outline", "other"];
 const understandInstruction = (courseTitle: string) =>
@@ -246,7 +245,7 @@ async function callClaude(model: string, content: unknown[], maxTokens: number):
 // ---------- stage: extract (v9: chunked + self-chaining, never loads big files) ----------
 // Each invocation does a SMALL batch of work, then chains to the next — the only way
 // to stay inside Edge CPU/memory limits on big uploads.
-const EXTRACT_BATCH = Number(Deno.env.get("EXTRACT_BATCH") ?? "4");
+const EXTRACT_BATCH = Number(Deno.env.get("EXTRACT_BATCH") ?? "3");
 
 // file size WITHOUT downloading (HEAD on a signed URL)
 async function headSize(path: string): Promise<number | null> {
@@ -378,11 +377,15 @@ async function doExtract(job: any) {
   let processedThisChunk = 0;
   let moreRemain = false;
 
+  const zipjs = zips.length > 0 ? await import("npm:@zip.js/zip.js@2.7.45") : null;
   for (const z of zips) {
     if (globalIdx >= hi && totalEntries > 0) { moreRemain = true; break; }
-    const dl = await db.storage.from(BUCKET).download(z.path);
-    if (dl.error || !dl.data) throw new Error(`could not download ${z.name}: ${dl.error?.message}`);
-    const zipReader = new ZipReader(new BlobReader(dl.data));
+    // STREAM the zip over HTTP ranges — only the central directory + the entries we
+    // actually extract ever enter memory. Downloading the whole blob is what kept
+    // killing the function (WORKER_RESOURCE_LIMIT).
+    const { data: su } = await db.storage.from(BUCKET).createSignedUrl(z.path, 600);
+    if (!su?.signedUrl) throw new Error(`could not sign ${z.name}`);
+    const zipReader = new zipjs!.ZipReader(new zipjs!.HttpReader(su.signedUrl, { useRangeHeader: true, forceRangeRequests: true, preventHeadRequest: false }));
     const entries = (await zipReader.getEntries()).filter((e: any) => !e.directory && !isJunk(e.filename));
     totalEntries += entries.length;
     if (totalEntries > MAX_FILES) { await zipReader.close(); throw new Error(`too many files (${totalEntries} > ${MAX_FILES})`); }
@@ -397,7 +400,7 @@ async function doExtract(job: any) {
         processedThisChunk++;
         continue;
       }
-      const bytes: Uint8Array = await entry.getData!(new Uint8ArrayWriter());
+      const bytes: Uint8Array = await entry.getData!(new zipjs!.Uint8ArrayWriter());
       await registerFile(entry.filename, bytes, null, globalIdx);
       processedThisChunk++;
     }
@@ -447,10 +450,15 @@ async function doRead(job: any) {
   }
 
   // safety net: never pull an oversize file into worker memory (kills the function)
-  if (typeof file.size_bytes === "number" && file.size_bytes > MAX_FILE_BYTES) {
+  let knownSize: number | null = typeof file.size_bytes === "number" ? file.size_bytes : null;
+  if (knownSize == null && file.storage_path) {
+    knownSize = await headSize(file.storage_path);
+    if (knownSize != null) await db.from("source_files").update({ size_bytes: knownSize }).eq("id", file.id);
+  }
+  if (knownSize != null && knownSize > MAX_FILE_BYTES) {
     await db.from("source_files").update({
       read_status: "unsupported",
-      note: `too large for processing (${Math.round(file.size_bytes / (1024 * 1024))}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
+      note: `too large for processing (${Math.round((knownSize ?? 0) / (1024 * 1024))}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
     }).eq("id", file.id);
     await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
     await logEvent(runId, "warning", `Skipped (too large): ${file.original_path}`);
@@ -470,6 +478,7 @@ async function doRead(job: any) {
     const bytes = new Uint8Array(await dl.data.arrayBuffer());
 
     if (file.mime_type === "application/pdf") {
+      const { getDocumentProxy, extractText } = await import("npm:unpdf@0.12.1");
       const pdf = await getDocumentProxy(bytes);
       pageCount = pdf.numPages;
       const result = await extractText(pdf, { mergePages: false });
@@ -518,14 +527,16 @@ async function doOcr(job: any) {
   const textPath = `text/${runId}/${file.id}.txt`;
 
   try {
-    const dl = await db.storage.from(BUCKET).download(file.storage_path);
-    if (dl.error || !dl.data) throw new Error("file missing in storage");
-    const bytes = new Uint8Array(await dl.data.arrayBuffer());
+    // OCR by URL: Claude fetches the file itself from a signed URL — the worker
+    // never downloads or parses the scan (this is what kept blowing memory).
+    const { data: su } = await db.storage.from(BUCKET).createSignedUrl(file.storage_path, 600);
+    if (!su?.signedUrl) throw new Error("file missing in storage");
+    const fileUrl = su.signedUrl;
 
     if (file.mime_type?.startsWith("image/")) {
       const { text, usage } = await callClaude(OCR_MODEL, [
-        { type: "image", source: { type: "base64", media_type: file.mime_type, data: toBase64(bytes) } },
-        { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", "1") },
+        { type: "image", source: { type: "url", url: fileUrl } },
+        { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", "1").replace("{LAST_PAGE}", "1") },
       ], OCR_MAX_TOKENS);
       await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(text), { contentType: "text/plain", upsert: true });
       await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
@@ -537,22 +548,23 @@ async function doOcr(job: any) {
       return;
     }
 
-    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
-    const total = src.getPageCount();
-    const cap = Math.min(total, MAX_OCR_PAGES);
+    const total: number | null = typeof file.page_count === "number" ? file.page_count : null;
+    if (total != null && total > 100) {
+      // Anthropic processes at most 100 pages per document request
+      await db.from("source_files").update({ read_status: "unsupported", note: `scanned PDF has ${total} pages — over the 100-page OCR limit; split it` }).eq("id", file.id);
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "warning", `Skipped OCR (over 100 pages): ${label}`);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
+    const cap = Math.min(total ?? MAX_OCR_PAGES, MAX_OCR_PAGES);
     const idx = job.chunk_index ?? 0;
     const start = idx * OCR_CHUNK_PAGES;
     const end = Math.min(start + OCR_CHUNK_PAGES, cap);
 
-    const out = await PDFDocument.create();
-    const indices = Array.from({ length: end - start }, (_, i) => start + i);
-    const copied = await out.copyPages(src, indices);
-    copied.forEach((p) => out.addPage(p));
-    const chunkBytes = await out.save();
-
     const { text, usage } = await callClaude(OCR_MODEL, [
-      { type: "document", source: { type: "base64", media_type: "application/pdf", data: toBase64(new Uint8Array(chunkBytes)) } },
-      { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", String(start + 1)) },
+      { type: "document", source: { type: "url", url: fileUrl } },
+      { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", String(start + 1)).replace("{LAST_PAGE}", String(end)) },
     ], OCR_MAX_TOKENS);
     await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
 
@@ -565,14 +577,14 @@ async function doOcr(job: any) {
     await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(merged), { contentType: "text/plain", upsert: true });
 
     if (end >= cap) {
-      const final = cap < total ? "partial" : "read";
+      const final = total != null && cap < total ? "partial" : "read";
       await db.from("source_files").update({
-        read_status: final, page_count: total, text_path: textPath,
-        note: cap < total ? `OCR limited to first ${cap} of ${total} pages` : null,
+        read_status: final, page_count: total ?? file.page_count, text_path: textPath,
+        note: total != null && cap < total ? `OCR limited to first ${cap} of ${total} pages` : null,
       }).eq("id", file.id);
       await enqueueUnderstand(runId, file.id);
       await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-      await logEvent(runId, "success", `Read (OCR): ${label}${cap < total ? " (partial)" : ""}`);
+      await logEvent(runId, "success", `Read (OCR): ${label}${total != null && cap < total ? " (partial)" : ""}`);
       await maybeFinalize(runId, file.course_id);
     } else {
       await db.from("onboarding_jobs").insert({ run_id: runId, stage: "ocr", file_id: file.id, chunk_index: idx + 1 });
@@ -1034,6 +1046,14 @@ async function tick(): Promise<{ worked: boolean }> {
 
 Deno.serve(async (req) => {
   if (req.method === "GET") {
+    const url = new URL(req.url);
+    if (url.searchParams.get("tick") === "1") {
+      // browser-refreshable resume: processes queued work and re-starts the
+      // self-chain. Returns what it did so you can watch progress.
+      const { worked } = await tick();
+      if (worked) fireNextTick();
+      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, worked, hint: worked ? "did one unit of work and chained the next — refresh to follow along" : "queue is empty" }), { headers: { "Content-Type": "application/json" } });
+    }
     return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION }), { headers: { "Content-Type": "application/json" } });
   }
   if (req.headers.get("x-worker-secret") !== WORKER_SECRET) return new Response("forbidden", { status: 403 });

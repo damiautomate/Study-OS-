@@ -927,3 +927,79 @@ exceed the ~2s CPU budget on a big zip even when every file is small.
 **Recovery:** redeploy the worker, confirm the ping says v9-chunked, and the stuck
 job resumes itself (you'll see "Unpacking… X/Y" progress). Still delete the duplicate
 "Circuits and Systems II" rows in Table Editor when convenient.
+
+---
+
+## v10-stream — the actual root cause, fixed and PROVEN
+
+**Root cause (visible across all three 546 logs — same ~5s death):** every version,
+including the "chunked" one, still **downloaded the whole zip into memory** before
+touching entries — and every invocation also paid the memory cost of importing the
+heavy PDF libraries at module top. The blob + libraries together is what
+WORKER_RESOURCE_LIMIT was killing, every time, at the same point.
+
+**v10 changes (architecture, not patches):**
+- **Zips are STREAMED over HTTP range requests** (zip.js HttpReader on a signed URL):
+  only the central directory and the entries actually being extracted ever enter
+  memory. *Proven with a real end-to-end test:* a zip served over real HTTP ranges —
+  entry listing, text entry content, and a 3MB binary all streamed byte-exact.
+- **Lazy library loading:** unpdf (read), pdf-lib (ocr), zip.js (extract) are now
+  imported inside their stages. An extract invocation never loads PDF parsers at all.
+- **HEAD-sizing everywhere:** unknown-size files (old runs!) are sized via HEAD on a
+  signed URL in BOTH extract and read — nothing is ever downloaded to find out it's
+  too big.
+- Safer free-tier defaults: MAX_FILE_MB=25, EXTRACT_BATCH=3 (both env-tunable up if
+  you upgrade your Supabase plan).
+- Ping: `{"ok":true,"worker":"v10-stream"}`.
+
+**Immediate cleanup (stops the crash loop now):** in the SQL editor:
+```sql
+delete from courses where title = 'Circuits and Systems II';
+```
+(cascades the broken runs/jobs/files). Then re-create the course once — the new UI
+declares sizes up front, shows upload %, and v10 streams the rest.
+
+---
+
+## v11-urlocr — OCR with zero worker memory (the last 546)
+
+**The good news first:** v10 fixed extraction — the logs show a long run of 200s,
+files reading, OCR chunks progressing, oversize files parked correctly. The remaining
+546 came from a different stage: **doOcr still downloaded each scanned PDF and parsed
+it with pdf-lib on every chunk** — image-heavy scans make that parse enormous.
+
+**v11:** OCR now sends Claude a **signed URL** (`document`/`image` source type "url")
+and a page-range instruction ("Transcribe ONLY pages X–Y… [[PAGE k]] markers"). Claude
+fetches the file itself — the worker never downloads, never parses, never base64s a
+scan. pdf-lib is gone from the worker entirely. Scans over 100 pages (Anthropic's
+per-request page limit) are marked clearly to split.
+
+The in-flight OCR jobs resume automatically once v11 is deployed (stale jobs are
+reclaimed within ~2 minutes). Ping: `{"ok":true,"worker":"v11-urlocr"}`.
+
+Note: with URL chunking the whole document counts as input per chunk call; raise
+`OCR_CHUNK_PAGES` (e.g. 12–15) to reduce the number of calls if cost matters.
+
+---
+
+## v12-tick — resuming dead chains (why "nothing happened" after deploying v11)
+
+**Root cause:** the worker is invoked by (a) a kick when you create a course, (b) its
+own self-chain, or (c) a cron watchdog. The 546 killed the self-chain mid-run, and the
+cron watchdog was designed-for but **never actually configured** — so after deploying
+v11 there was simply nothing left to invoke it. The queue (with your half-finished
+OCR jobs) sits intact, waiting.
+
+**Three layers so this can never strand you again:**
+1. **Browser resume:** open
+   `https://<project>.supabase.co/functions/v1/onboarding-worker?tick=1`
+   — each load does one unit of work AND restarts the self-chain. Refresh and watch
+   `worked: true`; the activity feed comes back to life.
+2. **In-app "resume ↻" button** on the course activity card (calls `/api/kick`).
+3. **Set up the cron (do this once):** Supabase Dashboard → **Cron** → Create job →
+   schedule `* * * * *` (every minute) → type **Edge Function** →
+   `onboarding-worker`, method POST, and add header `x-worker-secret: <your secret>`.
+   With it, any stalled queue resumes within a minute, forever, no humans involved.
+   (Same pattern later for `agent-heartbeat` daily sweeps.)
+
+Ping: `{"ok":true,"worker":"v12-tick"}`.
