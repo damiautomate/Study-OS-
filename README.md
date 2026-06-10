@@ -835,3 +835,35 @@ attach to the generated topics.)
   version: "Opening your upload… (worker v7-pages)".
 - The course page shows a hint when a run sits with zero activity (worker likely not
   deployed/booting).
+
+---
+
+## Verification pass (real tooling, not just builds)
+
+**What was tested and the results:**
+- **Deno type-check (`deno check`) on all 3 Edge Functions — PASS.** This caught and
+  fixed 4 real type errors (2 were genuine bugs: fallback understand results missing
+  the new `chapters` field — the likely cause of the failed worker deploy; plus a
+  crypto BufferSource strictness issue and a zip.js optional-method call).
+- **All 3 Edge Functions BOOTED locally under Deno** with the same entrypoint Supabase
+  uses: worker answers `GET → {"ok":true,"worker":"v7-pages"}`, all three return 403
+  without the secret, coach returns `{"ok":true}` on an authorized empty call. Logs clean.
+- **Unit tests for page logic — PASS** (parsePages ranges/lists/garbage/null;
+  sliceByPages single page, range, exclusion, legacy-text fallback). Caught and fixed a
+  formatting bug in page slicing.
+- **Production server smoke test:** all 8 pages return HTTP 200 with no SSR error
+  markers; all 7 API routes return clean validation errors (400) instead of crashing.
+
+**The stuck "Uploading 1/2" bug (your screenshot) — root cause & fix:**
+- supabase-js `upload()` exposes **no progress** and can sit silently on very large
+  files; and Supabase's **default per-file limit is 50MB** — a raw textbook/solution-
+  manual PDF often exceeds it (your earlier zips were compressed under it).
+- New `lib/upload.ts`: uploads now go through a **signed upload URL + XHR** with a
+  **live percentage** ("Uploading 1/2 — name… 37%"), a **90s stall timeout** with a
+  clear error instead of hanging forever, and a **pre-upload size guard** that names
+  the file and tells you the fix (zip it / split it / raise the limit in Supabase →
+  Storage → Settings). Used by both New course and Add materials.
+
+**What cannot be tested from here (requires your live keys):** the actual AI pipeline
+runs against your Supabase + Anthropic account. The version ping + versioned first
+activity line exist precisely so you can confirm the deployed worker in seconds.

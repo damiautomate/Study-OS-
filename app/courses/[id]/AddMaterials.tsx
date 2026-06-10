@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { ensureSession } from "@/lib/supabase/client";
+import { uploadWithProgress, checkFileSize } from "@/lib/upload";
 
 function errMsg(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -48,15 +49,19 @@ export default function AddMaterials({ courseId, onMerged }: { courseId: string;
       const supabase = supaRef.current ?? (await ensureSession());
       const { data: auth } = await supabase.auth.getUser();
       const uid = auth.user!.id;
+      for (const f of files) {
+        const sizeErr = checkFileSize(f);
+        if (sizeErr) throw new Error(sizeErr);
+      }
       const batch = crypto.randomUUID();
       const uploaded: { path: string; name: string }[] = [];
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
-        setStatus(`Uploading ${i + 1}/${files.length} — ${f.name}…`);
+        setStatus(`Uploading ${i + 1}/${files.length} — ${f.name}… 0%`);
         const safe = f.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
         const path = `${uid}/aug-${batch}/${i + 1}-${safe}`;
-        const up = await supabase.storage.from("course-uploads").upload(path, f, { upsert: false });
-        if (up.error) throw new Error(`${f.name}: ${up.error.message}`);
+        await uploadWithProgress(supabase, "course-uploads", path, f,
+          (pct) => setStatus(`Uploading ${i + 1}/${files.length} — ${f.name}… ${pct}%`));
         uploaded.push({ path, name: f.name });
       }
       setStatus("Merging into your course…");

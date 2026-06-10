@@ -61,7 +61,8 @@ async function logEvent(runId: string, kind: string, message: string, data?: unk
 }
 
 async function sha256(bytes: Uint8Array): Promise<string> {
-  const d = await crypto.subtle.digest("SHA-256", bytes);
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const d = await crypto.subtle.digest("SHA-256", ab);
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -306,7 +307,7 @@ async function doExtract(job: any) {
       if (totalBytes > MAX_TOTAL_UNCOMPRESSED) { await zipReader.close(); throw new Error("upload too large once unzipped"); }
       await logEvent(runId, "info", `Unzipped ${src.name} — ${files.length} files found`);
       for (const entry of files) {
-        const bytes: Uint8Array = await entry.getData(new Uint8ArrayWriter());
+        const bytes: Uint8Array = await entry.getData!(new Uint8ArrayWriter());
         await registerFile(entry.filename, bytes, null);
       }
       await zipReader.close();
@@ -532,9 +533,9 @@ async function doUnderstand(job: any) {
     }
 
     if (parsed) { result = normalizeUnderstanding(parsed); succeeded = true; }
-    else { result = { category: "other", category_confidence: 0, summary: "Could not classify automatically.", contains_questions: false, topics: [] }; }
+    else { result = { category: "other", category_confidence: 0, summary: "Could not classify automatically.", contains_questions: false, topics: [], chapters: [] }; }
   } catch (e) {
-    result = { category: "other", category_confidence: 0, summary: `Classification error: ${(e as Error).message}`.slice(0, 200), contains_questions: false, topics: [] };
+    result = { category: "other", category_confidence: 0, summary: `Classification error: ${(e as Error).message}`.slice(0, 200), contains_questions: false, topics: [], chapters: [] };
   }
 
   const relevantChapters = (result as any).chapters?.filter((c: any) => c.relevant) ?? [];

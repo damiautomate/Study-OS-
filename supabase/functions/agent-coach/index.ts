@@ -79,7 +79,7 @@ function sliceByPages(text: string, pages: Set<number>): string {
   let out = "";
   for (let i = 1; i < parts.length; i += 2) {
     const n = parseInt(parts[i], 10);
-    if (pages.has(n)) out += `[p.${n}] ${parts[i + 1] ?? ""}\n`;
+    if (pages.has(n)) out += `[p.${n}] ${(parts[i + 1] ?? "").trim()}\n`;
   }
   return out.trim();
 }
