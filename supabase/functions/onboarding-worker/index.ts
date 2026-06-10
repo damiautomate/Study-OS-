@@ -34,7 +34,7 @@ const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
 const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
 
-const WORKER_VERSION = "v8-bigfile";
+const WORKER_VERSION = "v9-chunked";
 // Edge functions get ~2s CPU / 256MB — never load big files into memory.
 const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "45");
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
@@ -243,16 +243,34 @@ async function callClaude(model: string, content: unknown[], maxTokens: number):
   throw new Error(lastErr);
 }
 
-// ---------- stage: extract ----------
+// ---------- stage: extract (v9: chunked + self-chaining, never loads big files) ----------
+// Each invocation does a SMALL batch of work, then chains to the next — the only way
+// to stay inside Edge CPU/memory limits on big uploads.
+const EXTRACT_BATCH = Number(Deno.env.get("EXTRACT_BATCH") ?? "4");
+
+// file size WITHOUT downloading (HEAD on a signed URL)
+async function headSize(path: string): Promise<number | null> {
+  try {
+    const { data: su } = await db.storage.from(BUCKET).createSignedUrl(path, 60);
+    if (!su?.signedUrl) return null;
+    const res = await fetch(su.signedUrl, { method: "HEAD" });
+    const len = Number(res.headers.get("content-length"));
+    return Number.isFinite(len) && len > 0 ? len : null;
+  } catch (_) { return null; }
+}
+
 async function doExtract(job: any) {
   const runId = job.run_id;
+  const chunk = job.chunk_index ?? 0;
   const { data: run } = await db.from("onboarding_runs").select("*").eq("id", runId).single();
   if (!run) throw new Error("run not found");
 
-  await db.from("onboarding_runs").update({ status: "running", stage: "extract", updated_at: new Date().toISOString() }).eq("id", runId);
-  await logEvent(runId, "stage", `Opening your upload… (worker ${WORKER_VERSION})`);
+  if (chunk === 0) {
+    await db.from("onboarding_runs").update({ status: "running", stage: "extract", updated_at: new Date().toISOString() }).eq("id", runId);
+    await logEvent(runId, "stage", `Opening your upload… (worker ${WORKER_VERSION})`);
+  }
 
-  // sources: legacy single zip_path, and/or a list of directly-uploaded files
+  // sources: legacy single zip_path, and/or directly-uploaded files
   const sources: { path: string; name: string; size?: number | null; mime?: string | null }[] = [];
   if (run.zip_path) sources.push({ path: run.zip_path, name: String(run.zip_path).split("/").pop() ?? "upload.zip", size: null, mime: null });
   if (Array.isArray(run.upload_paths)) {
@@ -265,16 +283,19 @@ async function doExtract(job: any) {
   }
   if (sources.length === 0) throw new Error("nothing to extract");
 
-  // dedupe across the WHOLE course (so augment skips files already onboarded)
+  // idempotency: anything this run already registered (by original name)
+  const { data: already } = await db.from("source_files").select("original_path").eq("run_id", runId);
+  const registeredNames = new Set((already ?? []).map((r: any) => r.original_path));
+
+  // course-wide content dedupe (augment runs skip files already onboarded)
   const seen = new Map<string, string>();
   const { data: priorFiles } = await db.from("source_files").select("content_hash, original_path").eq("course_id", run.course_id);
   for (const pf of priorFiles ?? []) if (pf.content_hash) seen.set(pf.content_hash, pf.original_path);
 
-  let idx = 0, dupes = 0, registered = 0;
+  let dupes = 0;
   const readJobs: any[] = [];
 
   async function registerOversize(originalName: string, sizeBytes: number | null, mime: string | null, existingPath: string | null) {
-    idx++;
     const mb = sizeBytes ? Math.round(sizeBytes / (1024 * 1024)) : null;
     await db.from("source_files").insert({
       course_id: run.course_id, run_id: runId, original_path: originalName,
@@ -283,11 +304,24 @@ async function doExtract(job: any) {
       read_status: "unsupported",
       note: `too large for processing (${mb ?? "?"}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
     });
+    registeredNames.add(originalName);
     await logEvent(runId, "warning", `Skipped (too large): ${originalName}${mb ? ` — ${mb}MB` : ""}`);
   }
 
-  async function registerFile(originalName: string, bytes: Uint8Array, existingPath: string | null) {
-    idx++;
+  // register WITHOUT bytes (no download): for medium-size direct files we trust storage
+  async function registerByPath(originalName: string, sizeBytes: number | null, mime: string | null, existingPath: string) {
+    const { data: inserted, error: insErr } = await db.from("source_files").insert({
+      course_id: run.course_id, run_id: runId, original_path: originalName,
+      storage_path: existingPath, content_hash: null, mime_type: mime ?? detectMime(originalName, new Uint8Array(0)),
+      size_bytes: sizeBytes,
+      read_status: "pending",
+    }).select("id").single();
+    if (insErr) throw new Error(`db insert failed: ${insErr.message}`);
+    registeredNames.add(originalName);
+    readJobs.push({ run_id: runId, stage: "read", file_id: inserted!.id });
+  }
+
+  async function registerFile(originalName: string, bytes: Uint8Array, existingPath: string | null, storageIdx: number) {
     const hash = bytes.length <= HASH_MAX_BYTES ? await sha256(bytes) : null;
     const mime = detectMime(originalName, bytes);
     const isDup = hash ? seen.has(hash) : false;
@@ -296,7 +330,7 @@ async function doExtract(job: any) {
       if (hash) seen.set(hash, originalName);
       if (!existingPath) {
         const safeName = originalName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
-        storagePath = `extracted/${runId}/${idx}-${safeName}`;
+        storagePath = `extracted/${runId}/${storageIdx}-${safeName}`;
         const up = await db.storage.from(BUCKET).upload(storagePath, bytes, { contentType: mime, upsert: true });
         if (up.error) throw new Error(`store failed for ${originalName}: ${up.error.message}`);
       }
@@ -310,67 +344,97 @@ async function doExtract(job: any) {
       note: isDup ? `duplicate of ${hash ? seen.get(hash) : ""}` : null,
     }).select("id").single();
     if (insErr) throw new Error(`db insert failed: ${insErr.message}`);
-    if (!isDup) { readJobs.push({ run_id: runId, stage: "read", file_id: inserted!.id }); registered++; }
+    registeredNames.add(originalName);
+    if (!isDup) readJobs.push({ run_id: runId, stage: "read", file_id: inserted!.id });
   }
 
-  let totalBytes = 0;
-  for (const src of sources) {
-    const isZip = /\.zip$/i.test(src.name) || /\.zip$/i.test(src.path);
-    // decide from the client-declared size BEFORE downloading — never pull a huge file into memory
-    if (!isZip && src.size != null && src.size > MAX_FILE_BYTES) {
-      await registerOversize(src.name, src.size, src.mime ?? null, src.path);
-      continue;
-    }
-    const dl = await db.storage.from(BUCKET).download(src.path);
-    if (dl.error || !dl.data) throw new Error(`could not download ${src.name}: ${dl.error?.message}`);
-
-    if (isZip) {
-      const zipReader = new ZipReader(new BlobReader(dl.data));
-      const entries = await zipReader.getEntries();
-      const files = entries.filter((e: any) => !e.directory && !isJunk(e.filename));
-      if (files.length > MAX_FILES) { await zipReader.close(); throw new Error(`too many files in ${src.name} (${files.length} > ${MAX_FILES})`); }
-      const totalUncompressed = files.reduce((s: number, e: any) => s + (e.uncompressedSize ?? 0), 0);
-      totalBytes += totalUncompressed;
-      if (totalBytes > MAX_TOTAL_UNCOMPRESSED) { await zipReader.close(); throw new Error("upload too large once unzipped"); }
-      await logEvent(runId, "info", `Unzipped ${src.name} — ${files.length} files found`);
-      for (const entry of files) {
-        if ((entry.uncompressedSize ?? 0) > MAX_FILE_BYTES) {
-          await registerOversize(entry.filename, entry.uncompressedSize ?? null, detectMime(entry.filename, new Uint8Array(0)), null);
-          continue;
-        }
-        const bytes: Uint8Array = await entry.getData!(new Uint8ArrayWriter());
-        await registerFile(entry.filename, bytes, null);
-      }
-      await zipReader.close();
-    } else {
+  // ---- chunk 0: direct (non-zip) files — cheap, no downloads beyond small hashes ----
+  if (chunk === 0) {
+    let di = 0;
+    for (const src of sources) {
+      const isZip = /\.zip$/i.test(src.name) || /\.zip$/i.test(src.path);
+      if (isZip) continue;
+      di++;
+      if (registeredNames.has(src.name)) continue; // resumed run
+      let size = src.size ?? null;
+      if (size == null) size = await headSize(src.path); // old runs didn't declare size
+      if (size != null && size > MAX_FILE_BYTES) { await registerOversize(src.name, size, src.mime ?? null, src.path); continue; }
+      if (size != null && size > HASH_MAX_BYTES) { await registerByPath(src.name, size, src.mime ?? null, src.path); continue; }
+      // small file: download to hash + sniff mime
+      const dl = await db.storage.from(BUCKET).download(src.path);
+      if (dl.error || !dl.data) throw new Error(`could not download ${src.name}: ${dl.error?.message}`);
       const bytes = new Uint8Array(await dl.data.arrayBuffer());
-      if (bytes.length > MAX_FILE_BYTES) {
-        // no declared size (or it lied) — verified after download as a fallback
-        await registerOversize(src.name, bytes.length, src.mime ?? null, src.path);
+      if (bytes.length > MAX_FILE_BYTES) { await registerOversize(src.name, bytes.length, src.mime ?? null, src.path); continue; }
+      await registerFile(src.name, bytes, src.path, 1000 + di);
+    }
+  }
+
+  // ---- zip entries: a flat cursor across all zips, EXTRACT_BATCH per invocation ----
+  const zips = sources.filter((s) => /\.zip$/i.test(s.name) || /\.zip$/i.test(s.path));
+  const lo = chunk * EXTRACT_BATCH;
+  const hi = lo + EXTRACT_BATCH;
+  let globalIdx = 0;
+  let totalEntries = 0;
+  let processedThisChunk = 0;
+  let moreRemain = false;
+
+  for (const z of zips) {
+    if (globalIdx >= hi && totalEntries > 0) { moreRemain = true; break; }
+    const dl = await db.storage.from(BUCKET).download(z.path);
+    if (dl.error || !dl.data) throw new Error(`could not download ${z.name}: ${dl.error?.message}`);
+    const zipReader = new ZipReader(new BlobReader(dl.data));
+    const entries = (await zipReader.getEntries()).filter((e: any) => !e.directory && !isJunk(e.filename));
+    totalEntries += entries.length;
+    if (totalEntries > MAX_FILES) { await zipReader.close(); throw new Error(`too many files (${totalEntries} > ${MAX_FILES})`); }
+
+    for (const entry of entries) {
+      globalIdx++;
+      if (globalIdx <= lo) continue;          // done in earlier chunks
+      if (globalIdx > hi) { moreRemain = true; break; }
+      if (registeredNames.has(entry.filename)) continue; // retried chunk
+      if ((entry.uncompressedSize ?? 0) > MAX_FILE_BYTES) {
+        await registerOversize(entry.filename, entry.uncompressedSize ?? null, detectMime(entry.filename, new Uint8Array(0)), null);
+        processedThisChunk++;
         continue;
       }
-      totalBytes += bytes.length;
-      if (totalBytes > MAX_TOTAL_UNCOMPRESSED) throw new Error("upload too large");
-      // direct upload already sits in storage — reuse its path, no copy
-      await registerFile(src.name, bytes, src.path);
+      const bytes: Uint8Array = await entry.getData!(new Uint8ArrayWriter());
+      await registerFile(entry.filename, bytes, null, globalIdx);
+      processedThisChunk++;
     }
-    if (idx > MAX_FILES) throw new Error(`too many files (${idx} > ${MAX_FILES})`);
+    await zipReader.close();
+    if (moreRemain) break;
   }
 
-  if (registered === 0 && dupes > 0) {
+  if (readJobs.length > 0) await db.from("onboarding_jobs").insert(readJobs);
+
+  if (moreRemain) {
+    // chain the next batch — small steps survive; marathons get killed
+    await db.from("onboarding_jobs").insert({ run_id: runId, stage: "extract", chunk_index: chunk + 1 });
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "info", `Unpacking… ${Math.min(hi, totalEntries)}/${totalEntries} files`);
+    fireNextTick();
+    return;
+  }
+
+  // last batch: tally + hand over to reading
+  const { count: regCount } = await db.from("source_files").select("id", { count: "exact", head: true })
+    .eq("run_id", runId).neq("read_status", "duplicate");
+  const { count: dupCount } = await db.from("source_files").select("id", { count: "exact", head: true })
+    .eq("run_id", runId).eq("read_status", "duplicate");
+  const totalDupes = dupCount ?? 0;
+  if ((regCount ?? 0) === 0 && totalDupes > 0) {
     await logEvent(runId, "info", "Everything you added was already in this course — nothing new to process");
-  } else if (registered === 0) {
+  } else if ((regCount ?? 0) === 0) {
     throw new Error("no readable files found in the upload");
   }
-
-  if (dupes > 0) await logEvent(runId, "info", `${dupes} duplicate ${dupes === 1 ? "file" : "files"} skipped`);
-  if (readJobs.length > 0) await db.from("onboarding_jobs").insert(readJobs);
+  if (totalDupes > 0) await logEvent(runId, "info", `${totalDupes} duplicate ${totalDupes === 1 ? "file" : "files"} skipped`);
   await db.from("onboarding_runs").update({ stage: "read", updated_at: new Date().toISOString() }).eq("id", runId);
   await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-  if (readJobs.length > 0) await logEvent(runId, "stage", `Reading ${readJobs.length} files…`);
+  const { count: pendCount } = await db.from("onboarding_jobs").select("id", { count: "exact", head: true })
+    .eq("run_id", runId).eq("stage", "read").in("status", ["queued", "processing"]);
+  if ((pendCount ?? 0) > 0) await logEvent(runId, "stage", `Reading ${pendCount} files…`);
   else await maybeFinalize(runId, run.course_id);
 }
-
 
 // ---------- stage: read ----------
 async function doRead(job: any) {

@@ -901,3 +901,29 @@ never recorded failure — it was reclaimed as stale and retried forever (the re
 4. For the solution manual itself: compress it, split it into chapter PDFs (best — the
    chapter-relevance feature then maps them precisely), or raise `MAX_FILE_MB` (worker
    env) *and* your Storage upload limit — noting bigger files cost more worker headroom.
+
+---
+
+## Hotfix v9-chunked — why v8 still hit WORKER_RESOURCE_LIMIT, and the real fix
+
+**Why v8 still died:** (1) the stuck job was created by the OLD build, so its
+upload records carried no declared size — and v8's fallback was "download, then
+check," but on Edge the download itself is the kill. (2) Extract did the ENTIRE
+zip (download → unzip → hash → re-upload every entry) in ONE invocation, which can
+exceed the ~2s CPU budget on a big zip even when every file is small.
+
+**v9 architecture (same pattern as the OCR stage):**
+- **HEAD-sizing:** files with no declared size get sized via a HEAD request on a
+  signed URL — never downloaded to find out they're too big.
+- **No pointless downloads:** direct files over 20MB (HASH_MAX_MB) are registered
+  by path without downloading at all; only small files are pulled for dedupe hashing.
+- **Chunked, self-chaining extraction:** zip entries are processed
+  `EXTRACT_BATCH` (default 4) per invocation with a flat cursor across zips; each
+  invocation chains the next (`Unpacking… 8/27 files` events) — no single call ever
+  does marathon work. Resumable + idempotent: a retried chunk skips files already
+  registered, so crashes can't duplicate rows.
+- Version ping: `{"ok":true,"worker":"v9-chunked"}`.
+
+**Recovery:** redeploy the worker, confirm the ping says v9-chunked, and the stuck
+job resumes itself (you'll see "Unpacking… X/Y" progress). Still delete the duplicate
+"Circuits and Systems II" rows in Table Editor when convenient.
