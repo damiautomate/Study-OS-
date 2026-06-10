@@ -59,11 +59,55 @@ async function callClaude(content: unknown[], maxTokens: number, tools?: unknown
   throw new Error(lastErr);
 }
 
+// "12-18,21" -> Set of page numbers
+function parsePages(spec: string | null): Set<number> | null {
+  if (!spec) return null;
+  const out = new Set<number>();
+  for (const part of spec.split(",")) {
+    const m = part.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!m) continue;
+    const a = parseInt(m[1], 10), b = m[2] ? parseInt(m[2], 10) : a;
+    for (let i = a; i <= Math.min(b, a + 400); i++) out.add(i);
+  }
+  return out.size ? out : null;
+}
+
+// keep only the [[PAGE n]] sections whose n is in the set
+function sliceByPages(text: string, pages: Set<number>): string {
+  const parts = text.split(/\[\[PAGE (\d+)\]\]/);
+  if (parts.length < 3) return text; // no markers (legacy text) — use whole
+  let out = "";
+  for (let i = 1; i < parts.length; i += 2) {
+    const n = parseInt(parts[i], 10);
+    if (pages.has(n)) out += `[p.${n}] ${parts[i + 1] ?? ""}\n`;
+  }
+  return out.trim();
+}
+
 async function materialText(topic: any): Promise<string> {
+  // prefer page-level refs (exact pages a topic uses)
+  const { data: refs } = await db.from("material_refs").select("file_id, pages").eq("topic_id", topic.id).limit(6);
+  let out = "";
+  if (refs && refs.length) {
+    const { data: files } = await db.from("source_files").select("id, original_path, text_path").in("id", refs.map((r: any) => r.file_id));
+    const byId = new Map((files ?? []).map((f: any) => [f.id, f]));
+    for (const r of refs) {
+      const f = byId.get(r.file_id);
+      if (!f?.text_path || out.length >= MAX_MATERIAL_CHARS) continue;
+      const dl = await db.storage.from(BUCKET).download(f.text_path);
+      if (dl.error || !dl.data) continue;
+      const full = await dl.data.text();
+      const pset = parsePages(r.pages);
+      const sliced = pset ? sliceByPages(full, pset) : full;
+      const name = String(f.original_path).split("/").pop();
+      out += `--- From ${name}${r.pages ? ` (pages ${r.pages})` : ""} ---\n` + sliced.slice(0, MAX_MATERIAL_CHARS - out.length) + "\n\n";
+    }
+    if (out.trim()) return out;
+  }
+  // fallback: whole files from source_file_ids (legacy courses)
   const ids: string[] = Array.isArray(topic.source_file_ids) ? topic.source_file_ids : [];
   if (ids.length === 0) return "";
   const { data: files } = await db.from("source_files").select("text_path").in("id", ids.slice(0, 5));
-  let out = "";
   for (const f of files ?? []) {
     if (!f.text_path || out.length >= MAX_MATERIAL_CHARS) continue;
     const dl = await db.storage.from(BUCKET).download(f.text_path);

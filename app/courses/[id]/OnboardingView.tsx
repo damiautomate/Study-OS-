@@ -6,6 +6,7 @@ import { ensureSession } from "@/lib/supabase/client";
 import AgentPanel from "./AgentPanel";
 import SchedulePanel from "./SchedulePanel";
 import CapstonePanel from "./CapstonePanel";
+import AddMaterials from "./AddMaterials";
 import type { Course, OnboardingRun, RunEvent, SourceFile, CourseTopic, Question } from "@/lib/types";
 import { effectiveDates, todayISO, daysBetween } from "@/lib/semester";
 
@@ -257,7 +258,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
                 <li key={f.id} className="rounded-lg border border-line/60 bg-raised/40 px-3 py-2">
                   <div className="flex items-baseline justify-between gap-3">
                     <span className="truncate text-sm text-paper/90">{f.original_path.split("/").pop()}</span>
-                    <span className="shrink-0 font-mono text-[11px] text-faint">{f.page_count ? `${f.page_count}p` : ""}{f.note && k !== "read" ? ` · ${f.note}` : ""}</span>
+                    <span className="shrink-0 font-mono text-[11px] text-faint">{f.page_count ? `${f.page_count}p` : ""}{f.note && (k !== "read" || f.note.startsWith("using:")) ? ` · ${f.note}` : ""}</span>
                   </div>
                   {f.category && (
                     <div className="mt-1.5 flex flex-wrap items-center gap-2">
@@ -343,7 +344,7 @@ export default function OnboardingView({ courseId }: { courseId: string }) {
           {tab === "plan" && (<div className="rise"><SchedulePanel courseId={courseId} /></div>)}
           {tab === "coach" && (<div className="rise"><AgentPanel courseId={courseId} /></div>)}
           {tab === "capstone" && (<div className="rise"><CapstonePanel courseId={courseId} /></div>)}
-          {tab === "materials" && (<div className="space-y-10 rise">{coverage}{courseMap}{questionBank}{inventory}</div>)}
+          {tab === "materials" && (<div className="space-y-10 rise"><AddMaterials courseId={courseId} onMerged={() => window.location.reload()} />{coverage}{courseMap}{questionBank}{inventory}</div>)}
         </>
       ) : (
         <div className="space-y-10">

@@ -734,3 +734,86 @@ changes — redeploy the web app.
 Streak + today-state dot + "start here" + check-pop + monthly stats — engagement aimed
 at *showing up to study*, consistent with the app's purpose (needing it less over time),
 not dark-pattern retention.
+
+---
+
+## Multi-file uploads + Add materials after onboarding
+
+### Deploy (order matters)
+1. **SQL editor:** run `0015_add_materials.sql` (after 0014).
+2. **Redeploy `onboarding-worker`** (new extract + `assign` stage + augment phase machine).
+3. **Redeploy the web app.**
+
+### Multi-file onboarding (no more zip-only)
+- **New course** now accepts **multiple files** — PDFs, images, notes, CSVs, and/or zips,
+  mixed freely. Each uploads directly from the browser (per-file progress), zips are
+  unpacked server-side, direct files are registered in place (no copy).
+- Dedupe is **course-wide by content hash**, so the same file never gets processed twice.
+
+### Add materials to an ONBOARDED course (Library tab → "Add materials")
+- Drop in new notes/textbook chapters/past questions any time. A background **augment
+  run** reads + OCRs + understands them, then a new **assign** stage merges them into
+  the EXISTING course map:
+  - files are attached to the existing topics they cover (AI-mapped with exact-title
+    validation + a deterministic title-match safety net — no hallucinated links);
+  - genuinely new content can add a topic under the right existing module;
+  - new question documents feed the question bank (only the new docs are scanned —
+    old ones aren't reprocessed);
+  - coverage counts recompute; mastery rows are seeded for any new topics;
+  - the course **stays onboarded** throughout — no re-review, nothing disturbed.
+- Live merge status streams into the panel; when done the Library refreshes.
+- This also means you can now **capture solutions for older courses**: re-add the past
+  papers and the questions stage stores their solution text for real answer-checking.
+
+### Material referencing — verified end-to-end
+The chain a recommendation rides on: spine/assign writes `topic.source_file_ids` →
+the Coach panel shows **Read: <note names>** per plan item (tappable → ownership-checked
+signed URL → the actual file opens) → question counts per topic → Explain/Practice pull
+from those same files/questions. The Coach panel now also **live-refreshes its topic→
+materials map** when a merge lands, so newly added notes appear on recommendations
+without a reload. (Curriculum/free courses benefit too: add real materials and they
+attach to the generated topics.)
+
+---
+
+## Textbook chapter relevance + exact-page references & saved excerpts
+
+### Deploy (order matters)
+1. **SQL editor:** run `0016_page_refs.sql` (after 0015).
+2. **Redeploy `onboarding-worker`** AND **`agent-coach`**.
+3. `npm install` includes **pdf-lib** (in package.json) — just redeploy the web app.
+
+### Page-aware extraction (the foundation)
+- PDF reading and OCR now embed **[[PAGE n]] markers** in all extracted text (OCR is
+  told each chunk's real starting page), so everything downstream knows exactly where
+  content lives.
+
+### Textbooks: only the chapters that matter
+- The understand stage now detects **chapters with page ranges** (from the ToC and
+  headings) and judges each chapter's **relevance to THIS course** — then extracts
+  topics **only from the relevant chapters**. The chapter map is stored
+  (`source_files.page_map`) and the Library shows "using: Ch 4 (p.118-167); …" on the
+  textbook. A 900-page book stops polluting the course map with 14 unrelated chapters.
+
+### Exact-page references (`material_refs`)
+- Spine and assign now record, per topic-material pair, the **specific pages** that
+  topic uses ("12-18"), deterministically taken from where the file's own topic entries
+  say the content lives. The Coach shows **"Lecture6.pdf · p.12-18"** on each plan item.
+
+### Saved page excerpts — individually or collectively
+- Tapping a paged reference calls **/api/excerpt**, which slices **just those pages**
+  out of the stored PDF (pdf-lib), **saves the excerpt** (`excerpts/{ref}.pdf`) so it's
+  built once and reused, and opens it. Non-PDFs or unpaged refs open the whole file.
+- **"open all pages ↗"** on a topic builds a combined **study pack**: every referenced
+  page for that topic, across all its materials, in one PDF.
+- The Coach's **Explain** is now grounded on those exact pages (text sliced by the
+  markers, labeled "From X (pages 12-18)") instead of whole files — tighter, cheaper,
+  more accurate.
+
+### Honest notes
+- Page data appears for **newly processed files** (markers are written at read/OCR
+  time). Older files keep working via the whole-file fallback; re-add a material to get
+  its page-level refs.
+- Page-number accuracy on born-digital PDFs is exact (extractor-counted); on OCR'd
+  scans it relies on the model following the numbered-marker instruction — verified by
+  prompt design, worth eyeballing on your first scanned textbook.

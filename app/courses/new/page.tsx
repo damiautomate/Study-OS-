@@ -10,7 +10,7 @@ export default function NewCourse() {
   const [title, setTitle] = useState("");
   const [code, setCode] = useState("");
   const [semesterStart, setSemesterStart] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
@@ -19,12 +19,8 @@ export default function NewCourse() {
 
   async function submit() {
     setError("");
-    if (!title.trim() || !semesterStart || !file) {
-      setError("Add a title, a start date, and a zip file.");
-      return;
-    }
-    if (!file.name.toLowerCase().endsWith(".zip")) {
-      setError("Please upload a .zip of the course materials.");
+    if (!title.trim() || !semesterStart || files.length === 0) {
+      setError("Add a title, a start date, and at least one file.");
       return;
     }
     setBusy(true);
@@ -33,18 +29,23 @@ export default function NewCourse() {
       const { data: auth } = await supabase.auth.getUser();
       const uid = auth.user!.id;
 
-      setStatus("Uploading your materials…");
-      const zipPath = `${uid}/${crypto.randomUUID()}.zip`;
-      const up = await supabase.storage
-        .from("course-uploads")
-        .upload(zipPath, file, { contentType: "application/zip", upsert: false });
-      if (up.error) throw new Error(up.error.message);
+      const batch = crypto.randomUUID();
+      const uploaded: { path: string; name: string }[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        setStatus(`Uploading ${i + 1}/${files.length} — ${f.name}…`);
+        const safe = f.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
+        const path = `${uid}/${batch}/${i + 1}-${safe}`;
+        const up = await supabase.storage.from("course-uploads").upload(path, f, { upsert: false });
+        if (up.error) throw new Error(`${f.name}: ${up.error.message}`);
+        uploaded.push({ path, name: f.name });
+      }
 
       setStatus("Setting things up…");
       const res = await fetch("/api/courses", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title.trim(), code: code.trim(), semesterStart, zipPath }),
+        body: JSON.stringify({ title: title.trim(), code: code.trim(), semesterStart, uploadPaths: uploaded }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Something went wrong.");
@@ -64,7 +65,7 @@ export default function NewCourse() {
       </button>
       <h1 className="text-3xl sm:text-4xl text-paper mb-2">New course</h1>
       <p className="text-muted mb-10 leading-relaxed">
-        Zip up everything for the course and drop it in. Tests are assumed around weeks 5–7,
+        Drop in everything for the course — individual PDFs, images, notes, or a .zip (or a mix). Tests are assumed around weeks 5–7,
         exams around weeks 12–13.
       </p>
 
@@ -91,22 +92,28 @@ export default function NewCourse() {
           )}
         </Field>
 
-        <Field label="Course materials (.zip)">
+        <Field label="Course materials">
           <label className="flex cursor-pointer items-center justify-center rounded-xl border border-dashed border-line bg-surface px-5 py-8 text-center transition hover:border-gold-dim">
             <input
               type="file"
-              accept=".zip,application/zip"
+              multiple
+              accept=".zip,.pdf,.png,.jpg,.jpeg,.webp,.txt,.csv,application/zip,application/pdf,image/*,text/plain,text/csv"
               className="hidden"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
             />
             <span className="text-sm text-muted">
-              {file ? (
-                <span className="text-paper">{file.name}</span>
+              {files.length > 0 ? (
+                <span className="text-paper">{files.length === 1 ? files[0].name : `${files.length} files selected`}</span>
               ) : (
-                <>Tap to choose a .zip file</>
+                <>Tap to choose files — PDFs, images, notes, or a .zip (mix is fine)</>
               )}
             </span>
           </label>
+          {files.length > 1 && (
+            <ul className="mt-2 max-h-28 space-y-0.5 overflow-y-auto font-mono text-[11px] text-faint">
+              {files.map((f, i) => <li key={i} className="truncate">· {f.name}</li>)}
+            </ul>
+          )}
         </Field>
 
         {error && <p className="text-sm text-rust">{error}</p>}

@@ -36,16 +36,20 @@ const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "300
 
 const OCR_PROMPT =
   "Transcribe all readable text from this document verbatim, preserving reading order. " +
-  "Include text from tables, figures, and handwriting where legible. Output ONLY the transcribed text, no commentary.";
+  "Include text from tables, figures, and handwriting where legible. " +
+  "Before each page's content, output a line containing exactly [[PAGE k]] using the page's real number in the whole document; " +
+  "the first page of this excerpt is page {FIRST_PAGE}. Output ONLY the markers and transcribed text, no commentary.";
 
 const CATEGORIES = ["slides", "textbook", "notes", "assignment", "test", "exam", "solutions", "outline", "other"];
-const UNDERSTAND_INSTRUCTION =
-  "You are cataloguing one document from a university course. Based ONLY on the text below, return a single JSON object and nothing else — no markdown fences, no explanation. " +
+const understandInstruction = (courseTitle: string) =>
+  `You are cataloguing one document from the university course "${courseTitle}". The text contains [[PAGE n]] markers showing page numbers. Based ONLY on the text below, return a single JSON object and nothing else — no markdown fences, no explanation. ` +
   'Keys: "category" (exactly one of: slides, textbook, notes, assignment, test, exam, solutions, outline, other), ' +
   '"category_confidence" (number 0 to 1), ' +
   '"summary" (2-3 sentences describing the document in plain language), ' +
   '"contains_questions" (true if it poses questions or problems to solve), ' +
-  '"topics" (array of short concept names the document covers). Text follows:\n\n';
+  '"chapters" (ONLY if this is a textbook or book: array of {"title","pages":"firstPage-lastPage","relevant":true|false} for every chapter you can identify — from a table of contents if present — judging "relevant" against THIS course; otherwise omit or []), ' +
+  '"topics" (array of {"title": short concept name, "pages": "n-m" page range where it is covered, from the [[PAGE n]] markers}). ' +
+  "If this is a textbook, give topics ONLY from the chapters relevant to this course — ignore unrelated chapters. Text follows:\n\n";
 
 const db = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
@@ -113,36 +117,42 @@ async function finishRun(runId: string, courseId: string) {
   await logEvent(runId, "stage", "Ready for your review");
 }
 
-// Drives the phase machine: read/understand → spine → questions → coverage → done.
+// Drives the phase machine.
+//   initial: read/understand → spine → questions(all docs) → coverage → review
+//   augment: read/understand → assign(merge into existing spine) → questions(new docs only) → coverage → done (course stays onboarded)
 async function maybeFinalize(runId: string, courseId: string) {
   const { count } = await db.from("onboarding_jobs").select("id", { count: "exact", head: true })
     .eq("run_id", runId).in("status", ["queued", "processing"]);
   if ((count ?? 0) > 0) return;
 
-  const { data: run } = await db.from("onboarding_runs").select("stage").eq("id", runId).single();
+  const { data: run } = await db.from("onboarding_runs").select("stage, kind").eq("id", runId).single();
   const stage = run?.stage as string | undefined;
+  const isAugment = run?.kind === "augment";
   if (!stage || stage === "done") return;
 
-  // (1) reading/understanding done -> build the spine
-  if (stage !== "spine" && stage !== "questions" && stage !== "coverage") {
+  // (1) reading/understanding done -> build the spine (initial) or merge (augment)
+  if (stage !== "spine" && stage !== "assign" && stage !== "questions" && stage !== "coverage") {
+    const next = isAugment ? "assign" : "spine";
     const { data: won } = await db.from("onboarding_runs")
-      .update({ stage: "spine", updated_at: new Date().toISOString() })
+      .update({ stage: next, updated_at: new Date().toISOString() })
       .eq("id", runId).eq("stage", stage).select("id");
     if (won && won.length > 0) {
-      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "spine" });
-      await logEvent(runId, "stage", "Building the topic map…");
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: next });
+      await logEvent(runId, "stage", isAugment ? "Merging into your course map…" : "Building the topic map…");
     }
     return;
   }
 
-  // (2) spine done -> extract questions
-  if (stage === "spine") {
+  // (2) spine/assign done -> extract questions
+  if (stage === "spine" || stage === "assign") {
     const { data: won } = await db.from("onboarding_runs")
       .update({ stage: "questions", updated_at: new Date().toISOString() })
-      .eq("id", runId).eq("stage", "spine").select("id");
+      .eq("id", runId).eq("stage", stage).select("id");
     if (won && won.length > 0) {
-      const { data: qdocs } = await db.from("source_files")
+      let q = db.from("source_files")
         .select("id").eq("course_id", courseId).in("read_status", ["read", "partial"]).eq("contains_questions", true);
+      if (isAugment) q = q.eq("run_id", runId); // only the NEW documents
+      const { data: qdocs } = await q;
       if (qdocs && qdocs.length > 0) {
         await db.from("onboarding_jobs").insert(qdocs.map((d: any) => ({ run_id: runId, stage: "questions", file_id: d.id })));
         await logEvent(runId, "stage", `Finding past questions in ${qdocs.length} ${qdocs.length === 1 ? "document" : "documents"}…`);
@@ -165,10 +175,26 @@ async function maybeFinalize(runId: string, courseId: string) {
     return;
   }
 
-  // (4) coverage done -> hand to review
+  // (4) coverage done -> review (initial) or quiet finish (augment)
   if (stage === "coverage") {
-    await finishRun(runId, courseId);
+    if (isAugment) await finishAugment(runId, courseId);
+    else await finishRun(runId, courseId);
   }
+}
+
+// Augment finish: run done, course STAYS onboarded; seed mastery for any new topics.
+async function finishAugment(runId: string, courseId: string) {
+  await db.from("onboarding_runs").update({ stage: "done", status: "done", updated_at: new Date().toISOString() }).eq("id", runId);
+  const { data: course } = await db.from("courses").select("user_id").eq("id", courseId).single();
+  if (course) {
+    const { data: tps } = await db.from("course_topics").select("id").eq("course_id", courseId).eq("level", 2);
+    const { data: have } = await db.from("student_mastery").select("topic_id").eq("course_id", courseId).eq("user_id", course.user_id);
+    const haveSet = new Set((have ?? []).map((m: any) => m.topic_id));
+    const missing = (tps ?? []).filter((t: any) => !haveSet.has(t.id))
+      .map((t: any) => ({ user_id: course.user_id, course_id: courseId, topic_id: t.id }));
+    if (missing.length) await db.from("student_mastery").upsert(missing, { onConflict: "user_id,topic_id", ignoreDuplicates: true });
+  }
+  await logEvent(runId, "stage", "New materials merged into your course ✓");
 }
 
 async function failJobAndRun(job: any, runId: string, msg: string) {
@@ -219,57 +245,93 @@ async function doExtract(job: any) {
   await db.from("onboarding_runs").update({ status: "running", stage: "extract", updated_at: new Date().toISOString() }).eq("id", runId);
   await logEvent(runId, "stage", "Opening your upload…");
 
-  const dl = await db.storage.from(BUCKET).download(run.zip_path);
-  if (dl.error || !dl.data) throw new Error(`could not download zip: ${dl.error?.message}`);
+  // sources: legacy single zip_path, and/or a list of directly-uploaded files
+  const sources: { path: string; name: string }[] = [];
+  if (run.zip_path) sources.push({ path: run.zip_path, name: String(run.zip_path).split("/").pop() ?? "upload.zip" });
+  if (Array.isArray(run.upload_paths)) {
+    for (const u of run.upload_paths) if (u && typeof u.path === "string") sources.push({ path: u.path, name: typeof u.name === "string" ? u.name : u.path.split("/").pop() });
+  }
+  if (sources.length === 0) throw new Error("nothing to extract");
 
-  const zipReader = new ZipReader(new BlobReader(dl.data));
-  const entries = await zipReader.getEntries();
-  const files = entries.filter((e: any) => !e.directory && !isJunk(e.filename));
-
-  if (files.length === 0) { await zipReader.close(); throw new Error("no readable files found in the zip"); }
-  if (files.length > MAX_FILES) { await zipReader.close(); throw new Error(`too many files (${files.length} > ${MAX_FILES})`); }
-  const totalUncompressed = files.reduce((s: number, e: any) => s + (e.uncompressedSize ?? 0), 0);
-  if (totalUncompressed > MAX_TOTAL_UNCOMPRESSED) { await zipReader.close(); throw new Error("upload too large once unzipped"); }
-
-  await logEvent(runId, "info", `Unzipped — ${files.length} files found`);
-
+  // dedupe across the WHOLE course (so augment skips files already onboarded)
   const seen = new Map<string, string>();
-  let dupes = 0, idx = 0;
+  const { data: priorFiles } = await db.from("source_files").select("content_hash, original_path").eq("course_id", run.course_id);
+  for (const pf of priorFiles ?? []) if (pf.content_hash) seen.set(pf.content_hash, pf.original_path);
+
+  let idx = 0, dupes = 0, registered = 0;
   const readJobs: any[] = [];
 
-  for (const entry of files) {
+  async function registerFile(originalName: string, bytes: Uint8Array, existingPath: string | null) {
     idx++;
-    const bytes: Uint8Array = await entry.getData(new Uint8ArrayWriter());
     const hash = await sha256(bytes);
-    const mime = detectMime(entry.filename, bytes);
-    const safeName = entry.filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
-    const storagePath = `extracted/${runId}/${idx}-${safeName}`;
-
+    const mime = detectMime(originalName, bytes);
     const isDup = seen.has(hash);
+    let storagePath: string | null = existingPath;
     if (!isDup) {
-      seen.set(hash, entry.filename);
-      const up = await db.storage.from(BUCKET).upload(storagePath, bytes, { contentType: mime, upsert: true });
-      if (up.error) throw new Error(`store failed for ${entry.filename}: ${up.error.message}`);
-    } else dupes++;
+      seen.set(hash, originalName);
+      if (!existingPath) {
+        const safeName = originalName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
+        storagePath = `extracted/${runId}/${idx}-${safeName}`;
+        const up = await db.storage.from(BUCKET).upload(storagePath, bytes, { contentType: mime, upsert: true });
+        if (up.error) throw new Error(`store failed for ${originalName}: ${up.error.message}`);
+      }
+    } else { dupes++; storagePath = null; }
 
     const { data: inserted, error: insErr } = await db.from("source_files").insert({
-      course_id: run.course_id, run_id: runId, original_path: entry.filename,
-      storage_path: isDup ? null : storagePath, content_hash: hash, mime_type: mime,
-      size_bytes: entry.uncompressedSize ?? bytes.length,
+      course_id: run.course_id, run_id: runId, original_path: originalName,
+      storage_path: storagePath, content_hash: hash, mime_type: mime,
+      size_bytes: bytes.length,
       read_status: isDup ? "duplicate" : "pending",
       note: isDup ? `duplicate of ${seen.get(hash)}` : null,
     }).select("id").single();
     if (insErr) throw new Error(`db insert failed: ${insErr.message}`);
-    if (!isDup) readJobs.push({ run_id: runId, stage: "read", file_id: inserted!.id });
+    if (!isDup) { readJobs.push({ run_id: runId, stage: "read", file_id: inserted!.id }); registered++; }
   }
-  await zipReader.close();
+
+  let totalBytes = 0;
+  for (const src of sources) {
+    const dl = await db.storage.from(BUCKET).download(src.path);
+    if (dl.error || !dl.data) throw new Error(`could not download ${src.name}: ${dl.error?.message}`);
+    const isZip = /\.zip$/i.test(src.name) || /\.zip$/i.test(src.path);
+
+    if (isZip) {
+      const zipReader = new ZipReader(new BlobReader(dl.data));
+      const entries = await zipReader.getEntries();
+      const files = entries.filter((e: any) => !e.directory && !isJunk(e.filename));
+      if (files.length > MAX_FILES) { await zipReader.close(); throw new Error(`too many files in ${src.name} (${files.length} > ${MAX_FILES})`); }
+      const totalUncompressed = files.reduce((s: number, e: any) => s + (e.uncompressedSize ?? 0), 0);
+      totalBytes += totalUncompressed;
+      if (totalBytes > MAX_TOTAL_UNCOMPRESSED) { await zipReader.close(); throw new Error("upload too large once unzipped"); }
+      await logEvent(runId, "info", `Unzipped ${src.name} — ${files.length} files found`);
+      for (const entry of files) {
+        const bytes: Uint8Array = await entry.getData(new Uint8ArrayWriter());
+        await registerFile(entry.filename, bytes, null);
+      }
+      await zipReader.close();
+    } else {
+      const bytes = new Uint8Array(await dl.data.arrayBuffer());
+      totalBytes += bytes.length;
+      if (totalBytes > MAX_TOTAL_UNCOMPRESSED) throw new Error("upload too large");
+      // direct upload already sits in storage — reuse its path, no copy
+      await registerFile(src.name, bytes, src.path);
+    }
+    if (idx > MAX_FILES) throw new Error(`too many files (${idx} > ${MAX_FILES})`);
+  }
+
+  if (registered === 0 && dupes > 0) {
+    await logEvent(runId, "info", "Everything you added was already in this course — nothing new to process");
+  } else if (registered === 0) {
+    throw new Error("no readable files found in the upload");
+  }
 
   if (dupes > 0) await logEvent(runId, "info", `${dupes} duplicate ${dupes === 1 ? "file" : "files"} skipped`);
   if (readJobs.length > 0) await db.from("onboarding_jobs").insert(readJobs);
   await db.from("onboarding_runs").update({ stage: "read", updated_at: new Date().toISOString() }).eq("id", runId);
   await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-  await logEvent(runId, "stage", `Reading ${readJobs.length} files…`);
+  if (readJobs.length > 0) await logEvent(runId, "stage", `Reading ${readJobs.length} files…`);
+  else await maybeFinalize(runId, run.course_id);
 }
+
 
 // ---------- stage: read ----------
 async function doRead(job: any) {
@@ -295,8 +357,9 @@ async function doRead(job: any) {
     if (file.mime_type === "application/pdf") {
       const pdf = await getDocumentProxy(bytes);
       pageCount = pdf.numPages;
-      const result = await extractText(pdf, { mergePages: true });
-      const text = (typeof result?.text === "string" ? result.text : "").trim();
+      const result = await extractText(pdf, { mergePages: false });
+      const pages: string[] = Array.isArray(result?.text) ? result.text : [String(result?.text ?? "")];
+      const text = pages.map((pg: string, i: number) => `[[PAGE ${i + 1}]]\n${(pg ?? "").trim()}`).join("\n\n").trim();
       if (text.length >= Math.max(40, pageCount * 20)) {
         textPath = `text/${runId}/${file.id}.txt`;
         await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(text), { contentType: "text/plain", upsert: true });
@@ -347,7 +410,7 @@ async function doOcr(job: any) {
     if (file.mime_type?.startsWith("image/")) {
       const { text, usage } = await callClaude(OCR_MODEL, [
         { type: "image", source: { type: "base64", media_type: file.mime_type, data: toBase64(bytes) } },
-        { type: "text", text: OCR_PROMPT },
+        { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", "1") },
       ], OCR_MAX_TOKENS);
       await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(text), { contentType: "text/plain", upsert: true });
       await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
@@ -374,7 +437,7 @@ async function doOcr(job: any) {
 
     const { text, usage } = await callClaude(OCR_MODEL, [
       { type: "document", source: { type: "base64", media_type: "application/pdf", data: toBase64(new Uint8Array(chunkBytes)) } },
-      { type: "text", text: OCR_PROMPT },
+      { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", String(start + 1)) },
     ], OCR_MAX_TOKENS);
     await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
 
@@ -424,10 +487,15 @@ function normalizeUnderstanding(o: any) {
   if (!(conf >= 0 && conf <= 1)) conf = 0.5;
   const summary = typeof o?.summary === "string" ? o.summary.slice(0, 600) : "";
   const contains_questions = !!o?.contains_questions;
+  const pagesOk = (x: any) => (typeof x === "string" && /^[0-9][0-9,\- ]*$/.test(x.trim()) ? x.trim().slice(0, 40) : null);
   const topics = Array.isArray(o?.topics)
-    ? o.topics.map((t: any) => ({ title: typeof t === "string" ? t : (t?.title ?? "") })).filter((t: any) => t.title).slice(0, 40)
+    ? o.topics.map((t: any) => ({ title: typeof t === "string" ? t : (t?.title ?? ""), pages: pagesOk(t?.pages) })).filter((t: any) => t.title).slice(0, 40)
     : [];
-  return { category, category_confidence: conf, summary, contains_questions, topics };
+  const chapters = Array.isArray(o?.chapters)
+    ? o.chapters.map((c: any) => ({ title: String(c?.title ?? "").slice(0, 200), pages: pagesOk(c?.pages), relevant: !!c?.relevant }))
+        .filter((c: any) => c.title).slice(0, 60)
+    : [];
+  return { category, category_confidence: conf, summary, contains_questions, topics, chapters };
 }
 
 async function doUnderstand(job: any) {
@@ -451,9 +519,10 @@ async function doUnderstand(job: any) {
 
     let parsed: any;
     for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
+      const { data: crs } = await db.from("courses").select("title").eq("id", file.course_id).single();
       const { text: out, usage } = await callClaude(
         UNDERSTAND_MODEL,
-        [{ type: "text", text: UNDERSTAND_INSTRUCTION + text }],
+        [{ type: "text", text: understandInstruction(crs?.title ?? "this course") + text }],
         UNDERSTAND_MAX_TOKENS,
       );
       await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "understand", model: UNDERSTAND_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
@@ -466,7 +535,13 @@ async function doUnderstand(job: any) {
     result = { category: "other", category_confidence: 0, summary: `Classification error: ${(e as Error).message}`.slice(0, 200), contains_questions: false, topics: [] };
   }
 
+  const relevantChapters = (result as any).chapters?.filter((c: any) => c.relevant) ?? [];
+  const focusNote = relevantChapters.length
+    ? `using: ${relevantChapters.map((c: any) => c.title + (c.pages ? ` (p.${c.pages})` : "")).join("; ").slice(0, 280)}`
+    : null;
   await db.from("source_files").update({
+    page_map: (result as any).chapters?.length ? (result as any).chapters : null,
+    note: focusNote ?? undefined,
     category: result.category,
     category_confidence: result.category_confidence,
     summary: result.summary,
@@ -524,13 +599,24 @@ async function doSpine(job: any) {
 
   const modules = Array.isArray(parsed?.modules) ? parsed.modules : [];
 
-  // deterministic topic-title -> source-file mapping (no hallucinated ids)
+  // deterministic topic-title -> source-file mapping (no hallucinated ids), now with pages
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
-  const fileTopics = docs.map((d: any) => ({ id: d.id, titles: (d.topics || []).map((t: any) => norm(t.title)) }));
-  const filesFor = (title: string) => {
+  const fileTopics = docs.map((d: any) => ({
+    id: d.id,
+    entries: (d.topics || []).map((t: any) => ({ n: norm(t.title), pages: t?.pages ?? null })),
+  }));
+  const refsFor = (title: string) => {
     const n = norm(title);
-    return fileTopics.filter((ft) => ft.titles.some((t) => t === n || t.includes(n) || n.includes(t))).map((ft) => ft.id);
+    const out: { file_id: string; pages: string | null }[] = [];
+    for (const ft of fileTopics) {
+      const hits = ft.entries.filter((e: any) => e.n === n || e.n.includes(n) || n.includes(e.n));
+      if (hits.length) out.push({ file_id: ft.id, pages: hits.find((h: any) => h.pages)?.pages ?? null });
+    }
+    return out;
   };
+  const filesFor = (title: string) => refsFor(title).map((r) => r.file_id);
+  const { data: courseRow } = await db.from("courses").select("user_id").eq("id", courseId).single();
+  const ownerId = courseRow?.user_id;
 
   let mi = 0, count = 0;
   for (const m of modules) {
@@ -544,16 +630,149 @@ async function doSpine(job: any) {
     for (const s of subs) {
       const title = typeof s === "string" ? s : (s?.title ?? "");
       if (!title) continue;
-      await db.from("course_topics").insert({
+      const refs = refsFor(title);
+      const { data: tRow } = await db.from("course_topics").insert({
         course_id: courseId, parent_id: parent!.id, level: 2, order_index: ti++,
-        title: String(title).slice(0, 200), source_file_ids: filesFor(title),
-      });
+        title: String(title).slice(0, 200), source_file_ids: refs.map((r) => r.file_id),
+      }).select("id").single();
+      if (tRow && ownerId && refs.length) {
+        await db.from("material_refs").upsert(
+          refs.map((r) => ({ user_id: ownerId, course_id: courseId, topic_id: tRow.id, file_id: r.file_id, pages: r.pages })),
+          { onConflict: "topic_id,file_id", ignoreDuplicates: true },
+        );
+      }
       count++;
     }
   }
 
   await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
   await logEvent(runId, count > 0 ? "success" : "warning", count > 0 ? `Topic map built — ${count} topics` : "Could not build the topic map automatically");
+  await maybeFinalize(runId, courseId);
+}
+
+// ---------- stage: assign (augment runs: merge new files into the EXISTING spine) ----------
+async function doAssign(job: any) {
+  const runId = job.run_id;
+  const { data: run } = await db.from("onboarding_runs").select("course_id").eq("id", runId).single();
+  if (!run) throw new Error("run not found");
+  const courseId = run.course_id;
+
+  // the NEW files from this run that were read + understood
+  const { data: newFiles } = await db.from("source_files")
+    .select("id, original_path, category, summary, topics")
+    .eq("run_id", runId).in("read_status", ["read", "partial"]);
+  // the EXISTING spine
+  const { data: spine } = await db.from("course_topics").select("id, parent_id, level, order_index, title").eq("course_id", courseId);
+  const modules = (spine ?? []).filter((t: any) => t.level === 1);
+  const topics = (spine ?? []).filter((t: any) => t.level === 2);
+
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+  const topicByNorm = new Map(topics.map((t: any) => [norm(t.title), t]));
+  const moduleByNorm = new Map(modules.map((m: any) => [norm(m.title), m]));
+
+  if (!newFiles || newFiles.length === 0) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "info", "No new readable files to merge");
+    await maybeFinalize(runId, courseId);
+    return;
+  }
+  if (topics.length === 0) {
+    // no spine to merge into (shouldn't happen for onboarded courses) — leave files in inventory
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "warning", "Course has no topic map; files kept in inventory");
+    await maybeFinalize(runId, courseId);
+    return;
+  }
+
+  const fileLines = newFiles.map((f: any, i: number) =>
+    `${i + 1}. "${f.original_path}" [${f.category ?? "unknown"}] — ${String(f.summary ?? "").slice(0, 220)} — covers: ${(f.topics || []).map((t: any) => t.title).join("; ").slice(0, 260)}`).join("\n");
+
+  const prompt =
+    "A student added NEW materials to an existing university course. Map each new file onto the EXISTING course map. " +
+    "Use EXACT titles from the lists. Only propose a new topic when the file clearly covers something missing from the map; attach it under the best existing module.\n\n" +
+    `EXISTING MODULES: ${JSON.stringify(modules.map((m: any) => m.title))}\n` +
+    `EXISTING TOPICS: ${JSON.stringify(topics.map((t: any) => t.title))}\n\n` +
+    `NEW FILES:\n${fileLines}\n\n` +
+    'Return ONLY JSON, no fences: {"files":[{"file":"exact file name from the list","topics":["existing topic title", "..."],"new_topics":[{"module":"existing module title","title":"new topic title"}]}]}';
+
+  let parsed: any = {};
+  try {
+    const { text, usage } = await callClaude(SPINE_MODEL, [{ type: "text", text: prompt }], 3000);
+    await db.from("ai_usage").insert({ run_id: runId, file_id: null, stage: "spine", model: SPINE_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+    parsed = parseUnderstanding(text);
+  } catch (_) { parsed = {}; }
+
+  const fileByName = new Map(newFiles.map((f: any) => [norm(f.original_path), f]));
+  const { data: courseRow } = await db.from("courses").select("user_id").eq("id", courseId).single();
+  const ownerId = courseRow?.user_id;
+  const pagesFor = (f: any, topicTitle: string) => {
+    const n = norm(topicTitle);
+    const hit = (f.topics || []).find((t: any) => { const tn = norm(t.title); return tn === n || tn.includes(n) || n.includes(tn); });
+    return hit?.pages ?? null;
+  };
+  const refRows: any[] = [];
+  const appendTo = new Map<string, Set<string>>(); // topic_id -> file ids to append
+  let newTopicCount = 0, mappedFiles = 0;
+
+  for (const row of (Array.isArray(parsed?.files) ? parsed.files : [])) {
+    const f = fileByName.get(norm(String(row?.file ?? "")));
+    if (!f) continue;
+    let mapped = false;
+    for (const tt of (Array.isArray(row?.topics) ? row.topics : [])) {
+      const t = topicByNorm.get(norm(String(tt)));
+      if (!t) continue;
+      const set = appendTo.get(t.id) ?? new Set<string>();
+      set.add(f.id); appendTo.set(t.id, set); mapped = true;
+      if (ownerId) refRows.push({ user_id: ownerId, course_id: courseId, topic_id: t.id, file_id: f.id, pages: pagesFor(f, t.title) });
+    }
+    for (const nt of (Array.isArray(row?.new_topics) ? row.new_topics : []).slice(0, 2)) {
+      const mod = moduleByNorm.get(norm(String(nt?.module ?? "")));
+      const title = String(nt?.title ?? "").trim();
+      if (!mod || !title || topicByNorm.has(norm(title))) continue;
+      const maxOrder = Math.max(0, ...topics.filter((t: any) => t.parent_id === mod.id).map((t: any) => t.order_index ?? 0));
+      const { data: created } = await db.from("course_topics").insert({
+        course_id: courseId, parent_id: mod.id, level: 2, order_index: maxOrder + 1,
+        title: title.slice(0, 200), source_file_ids: [f.id],
+      }).select("id, parent_id, order_index, title").single();
+      if (created) {
+        topics.push({ ...created, level: 2 }); topicByNorm.set(norm(title), created); newTopicCount++; mapped = true;
+        if (ownerId) refRows.push({ user_id: ownerId, course_id: courseId, topic_id: created.id, file_id: f.id, pages: pagesFor(f, title) });
+      }
+    }
+    if (mapped) mappedFiles++;
+  }
+
+  // deterministic safety net: any unmapped file still gets title-matched onto topics
+  for (const f of newFiles) {
+    const already = [...appendTo.values()].some((set) => set.has(f.id));
+    const inNew = topics.some((t: any) => Array.isArray((t as any).source_file_ids) && (t as any).source_file_ids?.includes?.(f.id));
+    if (already || inNew) continue;
+    const covered = (f.topics || []).map((t: any) => norm(t.title));
+    for (const t of topics) {
+      const n = norm(t.title);
+      if (covered.some((c: string) => c === n || c.includes(n) || n.includes(c))) {
+        const set = appendTo.get(t.id) ?? new Set<string>();
+        set.add(f.id); appendTo.set(t.id, set);
+        if (ownerId) refRows.push({ user_id: ownerId, course_id: courseId, topic_id: t.id, file_id: f.id, pages: pagesFor(f, t.title) });
+      }
+    }
+  }
+
+  // apply the appends (read-modify-write per topic, deduped)
+  for (const [topicId, ids] of appendTo) {
+    const { data: t } = await db.from("course_topics").select("source_file_ids").eq("id", topicId).single();
+    const cur: string[] = Array.isArray(t?.source_file_ids) ? t.source_file_ids : [];
+    const next = [...new Set([...cur, ...ids])];
+    if (next.length !== cur.length) await db.from("course_topics").update({ source_file_ids: next }).eq("id", topicId);
+  }
+
+  if (refRows.length) {
+    const seenRef = new Set<string>();
+    const unique = refRows.filter((r) => { const k = r.topic_id + ":" + r.file_id; if (seenRef.has(k)) return false; seenRef.add(k); return true; });
+    await db.from("material_refs").upsert(unique, { onConflict: "topic_id,file_id", ignoreDuplicates: true });
+  }
+  await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+  await logEvent(runId, "success", `Merged ${mappedFiles}/${newFiles.length} files into the map${newTopicCount ? ` · ${newTopicCount} new topic${newTopicCount === 1 ? "" : "s"}` : ""}`);
   await maybeFinalize(runId, courseId);
 }
 
@@ -688,6 +907,7 @@ async function tick(): Promise<{ worked: boolean }> {
     else if (job.stage === "ocr") await doOcr(job);
     else if (job.stage === "understand") await doUnderstand(job);
     else if (job.stage === "spine") await doSpine(job);
+    else if (job.stage === "assign") await doAssign(job);
     else if (job.stage === "questions") await doQuestions(job);
     else if (job.stage === "coverage") await doCoverage(job);
     else await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);

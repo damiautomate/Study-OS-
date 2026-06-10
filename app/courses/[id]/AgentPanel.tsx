@@ -16,8 +16,35 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
   const [items, setItems] = useState<PlanItem[]>([]);
   const [titles, setTitles] = useState<Map<string, string>>(new Map());
   const [mastery, setMastery] = useState<Map<string, StudentMastery>>(new Map());
-  const [materials, setMaterials] = useState<Map<string, { id: string; name: string }[]>>(new Map());
+  const [materials, setMaterials] = useState<Map<string, { id: string; refId: string | null; pages: string | null; name: string }[]>>(new Map());
   const [qByTopic, setQByTopic] = useState<Map<string, number>>(new Map());
+
+  // topic -> materials/question refs; re-run when new materials are merged in
+  async function refreshTopicRefs(supabase: any) {
+    const { data: tp } = await supabase.from("course_topics").select("id, title, source_file_ids").eq("course_id", courseId).eq("level", 2);
+    setTitles(new Map((tp ?? []).map((t: any) => [t.id, t.title])));
+    const { data: sf } = await supabase.from("source_files").select("id, original_path").eq("course_id", courseId);
+    const nameById = new Map((sf ?? []).map((f: any) => [f.id, String(f.original_path).split("/").pop()]));
+    const { data: rf } = await supabase.from("material_refs").select("id, topic_id, file_id, pages").eq("course_id", courseId);
+    const refsByTopic = new Map<string, any[]>();
+    for (const r of rf ?? []) {
+      const arr = refsByTopic.get(r.topic_id) ?? [];
+      const name = nameById.get(r.file_id);
+      if (name) arr.push({ id: r.file_id, refId: r.id, pages: r.pages, name });
+      refsByTopic.set(r.topic_id, arr);
+    }
+    setMaterials(new Map((tp ?? []).map((t: any) => {
+      const refs = refsByTopic.get(t.id);
+      if (refs && refs.length) return [t.id, refs];
+      return [t.id, (Array.isArray(t.source_file_ids) ? t.source_file_ids : [])
+        .map((id: string) => ({ id, refId: null, pages: null, name: nameById.get(id) as string }))
+        .filter((m: any) => m.name)];
+    })));
+    const { data: qd } = await supabase.from("questions").select("topic_id").eq("course_id", courseId);
+    const qmap = new Map<string, number>();
+    for (const q of qd ?? []) if (q.topic_id) qmap.set(q.topic_id, (qmap.get(q.topic_id) ?? 0) + 1);
+    setQByTopic(qmap);
+  }
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [eng, setEng] = useState<{ days: number | null; active7: number }>({ days: null, active7: 0 });
   const [thinking, setThinking] = useState(false);
@@ -47,20 +74,7 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
       const { data: auth } = await supabase.auth.getUser();
       setUid(auth.user?.id ?? null);
 
-      const { data: tp } = await supabase.from("course_topics").select("id, title, source_file_ids").eq("course_id", courseId).eq("level", 2);
-      setTitles(new Map((tp ?? []).map((t: any) => [t.id, t.title])));
-      const { data: sf } = await supabase.from("source_files").select("id, original_path").eq("course_id", courseId);
-      const nameById = new Map((sf ?? []).map((f: any) => [f.id, String(f.original_path).split("/").pop()]));
-      setMaterials(new Map((tp ?? []).map((t: any) => [
-        t.id,
-        (Array.isArray(t.source_file_ids) ? t.source_file_ids : [])
-          .map((id: string) => ({ id, name: nameById.get(id) as string }))
-          .filter((m: any) => m.name),
-      ])));
-      const { data: qd } = await supabase.from("questions").select("topic_id").eq("course_id", courseId);
-      const qmap = new Map<string, number>();
-      for (const q of qd ?? []) if (q.topic_id) qmap.set(q.topic_id, (qmap.get(q.topic_id) ?? 0) + 1);
-      setQByTopic(qmap);
+      await refreshTopicRefs(supabase);
 
       const { data: ms } = await supabase.from("student_mastery").select("*").eq("course_id", courseId);
       setMastery(new Map((ms ?? []).map((m: any) => [m.topic_id, m])));
@@ -115,10 +129,38 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
               setPending((prev) => { const n = new Set(prev); n.delete(`${row.topic_id}:application`); return n; });
             }
           })
+        .on("postgres_changes", { event: "*", schema: "public", table: "course_topics", filter: `course_id=eq.${courseId}` },
+          () => { refreshTopicRefs(supabase); })
         .subscribe();
     })();
     return () => { if (channel) channel.unsubscribe(); };
   }, [courseId]);
+
+  async function openRef(m: { id: string; refId: string | null; pages: string | null }, topicId: string) {
+    if (m.refId && m.pages) {
+      try {
+        const res = await fetch("/api/excerpt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ refId: m.refId }) });
+        const json = await res.json();
+        if (json.url) {
+          window.open(json.url, "_blank");
+          if (mastery.get(topicId)?.reading_state !== "read") await touch(topicId, { reading_state: "in_progress" }, "read");
+          return;
+        }
+      } catch { /* fall back to whole file */ }
+    }
+    await openMaterial(m.id, topicId);
+  }
+
+  async function openPack(topicId: string) {
+    try {
+      const res = await fetch("/api/excerpt", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topicId }) });
+      const json = await res.json();
+      if (json.url) {
+        window.open(json.url, "_blank");
+        if (mastery.get(topicId)?.reading_state !== "read") await touch(topicId, { reading_state: "in_progress" }, "read");
+      }
+    } catch { /* */ }
+  }
 
   async function openMaterial(fileId: string, topicId?: string) {
     try {
@@ -240,11 +282,18 @@ export default function AgentPanel({ courseId }: { courseId: string }) {
                             <span>
                               Read:{" "}
                               {materials.get(item.topic_id)!.map((m, idx, arr) => (
-                                <span key={m.id}>
-                                  <button onClick={() => openMaterial(m.id, item.topic_id!)} className="text-gold-dim underline-offset-2 hover:underline">{m.name}</button>
+                                <span key={m.refId ?? m.id}>
+                                  <button onClick={() => openRef(m, item.topic_id!)} className="text-gold-dim underline-offset-2 hover:underline">
+                                    {m.name}{m.pages ? <span className="font-mono"> · p.{m.pages}</span> : ""}
+                                  </button>
                                   {idx < arr.length - 1 ? ", " : ""}
                                 </span>
                               ))}
+                              {materials.get(item.topic_id)!.filter((m) => m.pages).length >= 2 && (
+                                <button onClick={() => openPack(item.topic_id!)} className="ml-2 rounded-md bg-gold/10 px-1.5 py-0.5 font-mono text-[10px] text-gold-dim transition hover:bg-gold/20">
+                                  open all pages ↗
+                                </button>
+                              )}
                             </span>
                           ) : "No notes tagged"}
                           {qByTopic.get(item.topic_id) ? ` · ${qByTopic.get(item.topic_id)} question${qByTopic.get(item.topic_id) === 1 ? "" : "s"}` : ""}
