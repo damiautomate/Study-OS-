@@ -1003,3 +1003,41 @@ OCR jobs) sits intact, waiting.
    (Same pattern later for `agent-heartbeat` daily sweeps.)
 
 Ping: `{"ok":true,"worker":"v12-tick"}`.
+
+---
+
+## v13-bg — beating the 150s wall-clock limit (504 IDLE_TIMEOUT / 546 @150s)
+
+**Diagnosis from the logs:** invocations dying at exactly ~150,000ms — the Edge
+Function REQUEST wall-clock limit. URL-OCR works (chunks keep completing), but on big
+scans Anthropic processes the whole document per call, and one slow call can outlive
+the entire request budget. Hour-long activity gaps also confirm the cron is still not
+configured — every kill stranded the queue until manually poked.
+
+**v13 changes:**
+- The worker now **responds instantly** and runs each beat as a **background task**
+  (`EdgeRuntime.waitUntil`) — background tasks get ~400s of wall clock instead of 150s.
+  No more 504 IDLE_TIMEOUT; slow OCR calls have room to finish.
+- **Anthropic calls have a hard 110s timeout** (`CLAUDE_TIMEOUT_MS` env) with backoff
+  retry — a hung call fails the attempt and retries instead of consuming the budget.
+- `?tick=1` and POST both return `{accepted:true}` immediately; work continues in the
+  background. /api/kick and the cron need only ~5s timeouts now.
+
+**CRON — required, two-minute setup (the missing piece all along):**
+SQL editor (replace YOUR_WORKER_SECRET; enable pg_cron + pg_net under Database →
+Extensions first if needed):
+```sql
+select cron.schedule(
+  'onboarding-worker-tick',
+  '* * * * *',
+  $$
+  select net.http_post(
+    url := 'https://gffyiaykiqbkpsseifsn.supabase.co/functions/v1/onboarding-worker',
+    headers := '{"Content-Type":"application/json","x-worker-secret":"YOUR_WORKER_SECRET"}'::jsonb,
+    body := '{}'::jsonb,
+    timeout_milliseconds := 5000
+  );
+  $$
+);
+```
+With this, any stall self-heals within a minute, forever. Ping: `v13-bg`.

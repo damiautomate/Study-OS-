@@ -33,7 +33,7 @@ const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
 const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
 
-const WORKER_VERSION = "v12-tick";
+const WORKER_VERSION = "v13-bg";
 // Edge functions get ~2s CPU / 256MB — never load big files into memory.
 const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "25");
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
@@ -216,14 +216,25 @@ async function failJobAndRun(job: any, runId: string, msg: string) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const CLAUDE_TIMEOUT_MS = Number(Deno.env.get("CLAUDE_TIMEOUT_MS") ?? "110000");
+
 async function callClaude(model: string, content: unknown[], maxTokens: number): Promise<{ text: string; usage: any }> {
   let lastErr = "call failed";
   for (let attempt = 0; attempt < 4; attempt++) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-      body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
-    });
+    let res: Response;
+    try {
+      res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "user", content }] }),
+        signal: AbortSignal.timeout(CLAUDE_TIMEOUT_MS),
+      });
+    } catch (e) {
+      // timed out or network dropped — retry with backoff rather than hanging forever
+      lastErr = `Claude call ${(e as Error).name === "TimeoutError" ? "timed out" : "failed"}: ${(e as Error).message}`.slice(0, 160);
+      await sleep(Math.pow(2, attempt) * 3000 + Math.floor(Math.random() * 800));
+      continue;
+    }
     if (res.ok) {
       const data = await res.json();
       const text = (data.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("").trim();
@@ -1044,20 +1055,39 @@ async function tick(): Promise<{ worked: boolean }> {
   return { worked: true };
 }
 
+// One beat: claim + process one job, chain the next if anything was done.
+async function runBeat() {
+  try {
+    const { worked } = await tick();
+    if (worked) fireNextTick();
+  } catch (_) { /* job-level failures are recorded by the stages themselves */ }
+}
+
+// Respond IMMEDIATELY and do the work as a background task: request handlers are
+// killed at 150s wall-clock, but background tasks get ~400s — slow OCR calls on big
+// scans need that headroom (this was the 504 IDLE_TIMEOUT / 150s kills).
+function startBeatInBackground(): boolean {
+  try {
+    // @ts-ignore EdgeRuntime provided by Supabase
+    EdgeRuntime.waitUntil(runBeat());
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === "GET") {
     const url = new URL(req.url);
     if (url.searchParams.get("tick") === "1") {
-      // browser-refreshable resume: processes queued work and re-starts the
-      // self-chain. Returns what it did so you can watch progress.
-      const { worked } = await tick();
-      if (worked) fireNextTick();
-      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, worked, hint: worked ? "did one unit of work and chained the next — refresh to follow along" : "queue is empty" }), { headers: { "Content-Type": "application/json" } });
+      const bg = startBeatInBackground();
+      if (!bg) await runBeat(); // local dev without EdgeRuntime
+      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, accepted: true, hint: "working in the background — watch the course activity feed; refresh to push again" }), { headers: { "Content-Type": "application/json" } });
     }
     return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION }), { headers: { "Content-Type": "application/json" } });
   }
   if (req.headers.get("x-worker-secret") !== WORKER_SECRET) return new Response("forbidden", { status: 403 });
-  const { worked } = await tick();
-  if (worked) fireNextTick();
-  return new Response(JSON.stringify({ worked }), { headers: { "Content-Type": "application/json" } });
+  const bg = startBeatInBackground();
+  if (!bg) await runBeat();
+  return new Response(JSON.stringify({ accepted: true }), { headers: { "Content-Type": "application/json" } });
 });
