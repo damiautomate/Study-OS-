@@ -1041,3 +1041,105 @@ select cron.schedule(
 );
 ```
 With this, any stall self-heals within a minute, forever. Ping: `v13-bg`.
+
+---
+
+## v14-ratelimit — handling the Anthropic 429 (free-tier 10k input tokens/min)
+
+**What the screenshots showed:** the pipeline SUCCEEDED — all 10 docs read, OCR'd,
+understood (incl. the 43-page TEST REVIEW). Two leftovers:
+1. Lecture_V landed as category "other" with `Claude 429: rate_limit_error … 10,000
+   input tokens per minute` — a free-tier Anthropic per-minute token ceiling hit when
+   several understand calls fell in the same minute. The old backoff capped at 45s and
+   gave up; it also stored the error as the category.
+2. The textbook sits in Waiting by design (over size limit) — not a bug.
+
+**Fixes:**
+- callClaude now treats 429 properly: honors `retry-after` /
+  `anthropic-ratelimit-*-reset` headers, and otherwise waits a full ~60s for the
+  per-MINUTE window to refill (up to 6 attempts), instead of giving up at 45s.
+- A transient failure (429/529/5xx/timeout) during understand no longer poisons the
+  record — the file is left unclassified and its job re-queued, so a later beat (or the
+  cron) re-classifies it cleanly.
+- MAX_UNDERSTAND_CHARS default lowered 30k→20k (~5k tokens) so a single doc fits the
+  free-tier window with margin.
+- **One-time repair for the doc already stuck as "other":** open
+  `…/functions/v1/onboarding-worker?reclassify=<COURSE_ID>` once. It re-queues any
+  doc whose classification failed with an error and processes it. (COURSE_ID is the
+  uuid in the course page URL.)
+
+Ping: `v14-ratelimit`.
+
+### If rate limits keep biting
+The free Anthropic tier (10k input tokens/min) is the real constraint with big slide
+decks. Options: add credits to raise your tier (cleanest), or set worker env
+`MAX_UNDERSTAND_CHARS` lower (e.g. 12000) to shrink each call. The pipeline will still
+complete either way — it now waits the limit out rather than failing.
+
+---
+
+## v15-nostorm — STOP the tick storm (runaway invocations / "EXCEEDING USAGE LIMITS")
+
+**What happened:** hundreds of worker POSTs per second, all 200s, no visible progress,
+quota burning. Cause was mine: three different places called `fireNextTick()` (runBeat,
+the POST handler, and v14's understand-retry), `fireNextTick` had **no concurrency
+guard**, AND the v14 understand-retry **instantly re-queued its own job** — so with the
+cron also ticking, invocations fanned out exponentially. The textbook was NOT being
+read (it's parked in Waiting); the queue was just thrashing.
+
+**EMERGENCY STOP (run in SQL editor if a storm is active):**
+```sql
+select cron.unschedule('onboarding-worker-tick');
+update onboarding_jobs set status = 'done'
+where run_id in (select id from onboarding_runs where course_id in
+  (select id from courses where title = 'Circuits and Systems II'));
+```
+
+**Structural fixes so it can never recur:**
+- **One and only one** place chains now: `runBeat()`. Removed the fire calls in the
+  extract branch and the understand-retry.
+- `fireNextTick()` is **single-flight** — a per-invocation guard means at most ONE next
+  tick is ever spawned, even if buggy code calls it repeatedly (unit-tested: 100
+  invocations × 3 attempted fires → exactly 100 chains, zero fan-out).
+- The understand rate-limit path **no longer re-queues itself** — it records the doc as
+  "other (re-classify later)" and lets the run finish; repair later via `?reclassify`.
+- **Circuit breaker:** any job attempted more than `JOB_MAX_ATTEMPTS` (default 6) is
+  retired and the run allowed to finalize — no job can drive an endless loop.
+
+**After deploying v15:** re-create the cron (the safe SQL from the v13 notes). The
+queue moves at a sane ~1 invocation per beat. Ping: `v15-nostorm`.
+
+---
+
+## v16-textbook — read ONLY the relevant chapters of a textbook (no whole-book reads)
+
+### Deploy (order matters)
+1. SQL editor: run `0017_textbook.sql` (after 0016).
+2. Redeploy `onboarding-worker`. 3. Redeploy web app.
+
+**The instruction implemented:** when a textbook is uploaded, find the chapter(s)
+relevant to the course and use only those — never the whole book.
+
+**How it works (100% URL-based — the worker never downloads the book):**
+- A big PDF in storage is now flagged `is_textbook` and routed to a new **textbook**
+  stage instead of being parked in Waiting.
+- **Plan (chunk 0):** gets the page count by URL, then reads ONLY the front-matter /
+  table of contents (first ≤25 pages) by URL and asks the AI which chapters are
+  relevant to THIS course, with their printed page ranges.
+- **Read (chunks 1..N):** OCRs ONLY those chapters' page ranges, in small ≤8-page
+  windows, by URL — self-chaining one window per invocation (memory-safe, storm-safe via
+  the v15 single-flight guard + attempt cap). A hard page budget (`TEXTBOOK_MAX_PAGES`,
+  default 80) caps total pages read; windowing is unit-tested to stay in-range and never
+  exceed the cap.
+- The extracted chapter text then flows through the normal understand → spine →
+  material-refs path, so the textbook's relevant pages become referenceable like any
+  other material ("Textbook · Ch4 · p.118-125").
+- If NO chapter matches the course, it reads nothing and says so — it never falls back
+  to reading the whole book.
+
+**For your already-stuck textbook:** after deploying v16, it will be picked up from
+Waiting on the next tick (the doRead oversize guard now reroutes big PDFs to the
+textbook stage). Watch for "Scanning … for relevant chapters…" then "Reading … Ch X
+p.A-B". Tunables: `TEXTBOOK_MAX_PAGES` (80), `TEXTBOOK_WINDOW` (8).
+
+Ping: `v16-textbook`.

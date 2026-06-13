@@ -31,9 +31,9 @@ const OCR_CHUNK_PAGES = Number(Deno.env.get("OCR_CHUNK_PAGES") ?? "8");
 const MAX_OCR_PAGES = Number(Deno.env.get("MAX_OCR_PAGES") ?? "200");
 const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
-const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "30000");
+const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "20000");
 
-const WORKER_VERSION = "v13-bg";
+const WORKER_VERSION = "v16-textbook";
 // Edge functions get ~2s CPU / 256MB — never load big files into memory.
 const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "25");
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
@@ -100,7 +100,12 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
+// Single-flight chaining: at most ONE next-tick in flight per invocation. Combined
+// with chaining only from runBeat(), this makes a tick storm structurally impossible.
+let _chained = false;
 function fireNextTick() {
+  if (_chained) return;
+  _chained = true;
   try {
     // @ts-ignore EdgeRuntime provided by Supabase
     EdgeRuntime.waitUntil(
@@ -220,7 +225,8 @@ const CLAUDE_TIMEOUT_MS = Number(Deno.env.get("CLAUDE_TIMEOUT_MS") ?? "110000");
 
 async function callClaude(model: string, content: unknown[], maxTokens: number): Promise<{ text: string; usage: any }> {
   let lastErr = "call failed";
-  for (let attempt = 0; attempt < 4; attempt++) {
+  const MAX_ATTEMPTS = Number(Deno.env.get("CLAUDE_MAX_ATTEMPTS") ?? "6");
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     let res: Response;
     try {
       res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -243,9 +249,17 @@ async function callClaude(model: string, content: unknown[], maxTokens: number):
     lastErr = `Claude ${res.status}: ${(await res.text()).slice(0, 160)}`;
     // 429 = rate limited, 529 = overloaded, 5xx = transient -> back off and retry
     if (res.status === 429 || res.status === 529 || res.status >= 500) {
-      const ra = parseInt(res.headers.get("retry-after") ?? "", 10);
-      const backoff = Math.min(45, Number.isFinite(ra) && ra > 0 ? ra : Math.pow(2, attempt) * 4);
-      await sleep(backoff * 1000 + Math.floor(Math.random() * 800));
+      // honor server timing hints; for 429 the input-token window is per-MINUTE, so
+      // wait long enough for it to actually refill instead of giving up.
+      const retryAfter = parseInt(res.headers.get("retry-after") ?? "", 10);
+      const resetHdr = res.headers.get("anthropic-ratelimit-input-tokens-reset");
+      let waitS: number;
+      if (Number.isFinite(retryAfter) && retryAfter > 0) waitS = retryAfter;
+      else if (resetHdr) waitS = Math.max(1, Math.ceil((new Date(resetHdr).getTime() - Date.now()) / 1000));
+      else if (res.status === 429) waitS = 60; // assume a full per-minute window
+      else waitS = Math.pow(2, attempt) * 4;
+      waitS = Math.min(75, waitS) + 2; // cap so a single beat stays inside the ~400s budget
+      await sleep(waitS * 1000 + Math.floor(Math.random() * 800));
       continue;
     }
     throw new Error(lastErr); // non-retryable (bad request, auth, etc.)
@@ -307,12 +321,29 @@ async function doExtract(job: any) {
 
   async function registerOversize(originalName: string, sizeBytes: number | null, mime: string | null, existingPath: string | null) {
     const mb = sizeBytes ? Math.round(sizeBytes / (1024 * 1024)) : null;
+    const resolvedMime = mime ?? detectMime(originalName, new Uint8Array(0));
+    // A big PDF that lives in storage is treated as a TEXTBOOK: we don't skip it, we
+    // read only the chapters relevant to this course — entirely by URL, never loading
+    // the whole book into memory. (Needs a storage path to stream from; zip entries
+    // have none, so those still get parked.)
+    if (resolvedMime === "application/pdf" && existingPath) {
+      const { data: inserted } = await db.from("source_files").insert({
+        course_id: run.course_id, run_id: runId, original_path: originalName,
+        storage_path: existingPath, content_hash: null, mime_type: resolvedMime,
+        size_bytes: sizeBytes, read_status: "pending", is_textbook: true,
+        note: `textbook (${mb ?? "?"}MB) — will read only the chapters relevant to this course`,
+      }).select("id").single();
+      registeredNames.add(originalName);
+      if (inserted) readJobs.push({ run_id: runId, stage: "textbook", file_id: inserted.id, chunk_index: 0 });
+      await logEvent(runId, "info", `Textbook detected: ${originalName} — will read only relevant chapters`);
+      return;
+    }
     await db.from("source_files").insert({
       course_id: run.course_id, run_id: runId, original_path: originalName,
-      storage_path: existingPath, content_hash: null, mime_type: mime ?? detectMime(originalName, new Uint8Array(0)),
+      storage_path: existingPath, content_hash: null, mime_type: resolvedMime,
       size_bytes: sizeBytes,
       read_status: "unsupported",
-      note: `too large for processing (${mb ?? "?"}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
+      note: `too large for processing (${mb ?? "?"}MB > ${MAX_FILE_MB}MB) — compress or split it`,
     });
     registeredNames.add(originalName);
     await logEvent(runId, "warning", `Skipped (too large): ${originalName}${mb ? ` — ${mb}MB` : ""}`);
@@ -426,7 +457,6 @@ async function doExtract(job: any) {
     await db.from("onboarding_jobs").insert({ run_id: runId, stage: "extract", chunk_index: chunk + 1 });
     await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
     await logEvent(runId, "info", `Unpacking… ${Math.min(hi, totalEntries)}/${totalEntries} files`);
-    fireNextTick();
     return;
   }
 
@@ -467,9 +497,18 @@ async function doRead(job: any) {
     if (knownSize != null) await db.from("source_files").update({ size_bytes: knownSize }).eq("id", file.id);
   }
   if (knownSize != null && knownSize > MAX_FILE_BYTES) {
+    if (file.mime_type === "application/pdf" && file.storage_path) {
+      // big textbook: read only relevant chapters (handled by the textbook stage)
+      await db.from("source_files").update({ is_textbook: true, note: `textbook (${Math.round(knownSize / (1024 * 1024))}MB) — will read only the chapters relevant to this course` }).eq("id", file.id);
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 0 });
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "info", `Textbook detected: ${file.original_path} — will read only relevant chapters`);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
     await db.from("source_files").update({
       read_status: "unsupported",
-      note: `too large for processing (${Math.round((knownSize ?? 0) / (1024 * 1024))}MB > ${MAX_FILE_MB}MB) — compress, split into chapters, or raise MAX_FILE_MB`,
+      note: `too large for processing (${Math.round((knownSize ?? 0) / (1024 * 1024))}MB > ${MAX_FILE_MB}MB) — compress or split it`,
     }).eq("id", file.id);
     await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
     await logEvent(runId, "warning", `Skipped (too large): ${file.original_path}`);
@@ -525,6 +564,158 @@ async function doRead(job: any) {
 }
 
 // ---------- stage: ocr ----------
+// ---------- stage: textbook (read ONLY the chapters relevant to this course) ----------
+// Entirely URL-based: the worker never downloads the book. Self-chains across
+// invocations: chunk 0 plans (page count + ToC -> relevant chapter ranges); chunks
+// 1..N OCR each planned window by URL; then stitch + understand.
+const TEXTBOOK_WINDOW = Number(Deno.env.get("TEXTBOOK_WINDOW") ?? "8"); // pages per OCR call
+
+// Ask Claude how many pages the PDF has, by URL (no download).
+async function pdfPageCountByUrl(fileUrl: string): Promise<number | null> {
+  try {
+    const { text } = await callClaude(OCR_MODEL, [
+      { type: "document", source: { type: "url", url: fileUrl } },
+      { type: "text", text: 'How many pages does this PDF have in total? Reply with ONLY the integer, nothing else.' },
+    ], 20);
+    const n = parseInt(String(text).replace(/[^0-9]/g, ""), 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch (_) { return null; }
+}
+
+async function doTextbook(job: any) {
+  const runId = job.run_id;
+  const chunk = job.chunk_index ?? 0;
+  const { data: file } = await db.from("source_files").select("*").eq("id", job.file_id).single();
+  if (!file) { await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id); return; }
+  const label = file.original_path.split("/").pop();
+
+  const { data: su } = await db.storage.from(BUCKET).createSignedUrl(file.storage_path, 1800);
+  if (!su?.signedUrl) throw new Error("textbook file missing in storage");
+  const fileUrl = su.signedUrl;
+
+  // ----- chunk 0: build the chapter plan -----
+  if (chunk === 0) {
+    await logEvent(runId, "stage", `Scanning ${label} for relevant chapters…`);
+    const pages = (typeof file.page_count === "number" && file.page_count > 0)
+      ? file.page_count : await pdfPageCountByUrl(fileUrl);
+    if (!pages) {
+      await db.from("source_files").update({ read_status: "unsupported", note: "could not read textbook page count" }).eq("id", file.id);
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "warning", `Couldn't open textbook: ${label}`);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
+    await db.from("source_files").update({ page_count: pages }).eq("id", file.id);
+
+    // read the FRONT MATTER (table of contents) only — first up to 25 pages — by URL
+    const { data: crs } = await db.from("courses").select("title").eq("id", file.course_id).single();
+    const tocEnd = Math.min(25, pages);
+    const planPrompt =
+      `This is the front matter of a textbook. The course is "${crs?.title ?? "this course"}". ` +
+      `From the table of contents on pages 1-${tocEnd}, identify the chapters whose topics are relevant to this course. ` +
+      `Use the printed page ranges from the ToC. Return ONLY JSON, no fences: ` +
+      `{"chapters":[{"title":"...","pages":"START-END","relevant":true|false}]} — include the page range for each relevant chapter. ` +
+      `Be selective: a typical course uses 2-5 chapters of a big textbook, not all of it.`;
+    let chapters: any[] = [];
+    try {
+      const { text, usage } = await callClaude(SPINE_MODEL, [
+        { type: "document", source: { type: "url", url: fileUrl } },
+        { type: "text", text: planPrompt },
+      ], 2000);
+      await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "understand", model: SPINE_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+      const parsed = parseUnderstanding(text);
+      chapters = Array.isArray(parsed?.chapters) ? parsed.chapters : [];
+    } catch (_) { chapters = []; }
+
+    // turn relevant chapters into capped, in-range OCR windows
+    const parseRange = (sp: string): [number, number] | null => {
+      const m = String(sp).match(/(\d+)\s*-\s*(\d+)/);
+      if (!m) return null;
+      let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+      a = Math.max(1, Math.min(a, pages)); b = Math.max(1, Math.min(b, pages));
+      return a <= b ? [a, b] : null;
+    };
+    const relevant = chapters.filter((c: any) => c?.relevant && c?.pages);
+    const MAX_TB_PAGES = Number(Deno.env.get("TEXTBOOK_MAX_PAGES") ?? "80");
+    const windows: { title: string; start: number; end: number }[] = [];
+    let budget = MAX_TB_PAGES;
+    for (const c of relevant) {
+      const r = parseRange(c.pages);
+      if (!r) continue;
+      for (let p = r[0]; p <= r[1] && budget > 0; p += TEXTBOOK_WINDOW) {
+        const end = Math.min(p + TEXTBOOK_WINDOW - 1, r[1], p + budget - 1);
+        windows.push({ title: String(c.title ?? "Chapter").slice(0, 120), start: p, end });
+        budget -= (end - p + 1);
+      }
+    }
+
+    if (windows.length === 0) {
+      // no relevant chapters found — leave it parked rather than reading the whole book
+      await db.from("source_files").update({
+        read_status: "unsupported",
+        page_map: chapters.length ? chapters : null,
+        note: "no chapters matched this course — open it manually from the library, or split the relevant chapters into their own PDF",
+      }).eq("id", file.id);
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "info", `${label}: no chapters matched this course — skipped (nothing irrelevant was read)`);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
+
+    await db.from("source_files").update({
+      chapter_plan: { windows, done: 0 },
+      page_map: relevant.length ? relevant : null,
+      note: `using: ${relevant.map((c: any) => `${c.title} (p.${c.pages})`).join("; ").slice(0, 280)}`,
+    }).eq("id", file.id);
+    await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 1 });
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    const totalPages = windows.reduce((s, w) => s + (w.end - w.start + 1), 0);
+    await logEvent(runId, "stage", `Reading ${relevant.length} relevant chapter${relevant.length === 1 ? "" : "s"} of ${label} (${totalPages} pages)…`);
+    await maybeFinalize(runId, file.course_id);
+    return;
+  }
+
+  // ----- chunks 1..N: OCR one planned window by URL -----
+  const plan = file.chapter_plan as { windows: { title: string; start: number; end: number }[]; done: number } | null;
+  if (!plan || !Array.isArray(plan.windows)) {
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await maybeFinalize(runId, file.course_id);
+    return;
+  }
+  const wIdx = chunk - 1;
+  if (wIdx >= plan.windows.length) {
+    // finished all windows: stitch saved text, mark read, understand
+    const textPath = `text/${runId}/${file.id}.txt`;
+    await db.from("source_files").update({ read_status: "read", text_path: textPath, page_count: file.page_count }).eq("id", file.id);
+    await enqueueUnderstand(runId, file.id);
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "success", `Read (textbook, relevant chapters): ${label}`);
+    await maybeFinalize(runId, file.course_id);
+    return;
+  }
+
+  const w = plan.windows[wIdx];
+  const textPath = `text/${runId}/${file.id}.txt`;
+  const { text, usage } = await callClaude(OCR_MODEL, [
+    { type: "document", source: { type: "url", url: fileUrl } },
+    { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", String(w.start)).replace("{LAST_PAGE}", String(w.end)) },
+  ], OCR_MAX_TOKENS);
+  await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+
+  // append to the accumulating text file
+  let prior = "";
+  try { const dl = await db.storage.from(BUCKET).download(textPath); if (!dl.error && dl.data) prior = await dl.data.text(); } catch (_) { /* first window */ }
+  const merged = prior + (prior ? "\n\n" : "") + `[[CHAPTER ${w.title}]]\n` + text;
+  await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(merged), { contentType: "text/plain", upsert: true });
+
+  await db.from("source_files").update({ chapter_plan: { windows: plan.windows, done: wIdx + 1 } }).eq("id", file.id);
+  await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: chunk + 1 });
+  await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+  await logEvent(runId, "info", `Reading ${label}: ${w.title} p.${w.start}-${w.end} (${wIdx + 1}/${plan.windows.length})`);
+  await maybeFinalize(runId, file.course_id);
+}
+
 async function doOcr(job: any) {
   const runId = job.run_id;
   const { data: file } = await db.from("source_files").select("*").eq("id", job.file_id).single();
@@ -670,7 +861,16 @@ async function doUnderstand(job: any) {
     if (parsed) { result = normalizeUnderstanding(parsed); succeeded = true; }
     else { result = { category: "other", category_confidence: 0, summary: "Could not classify automatically.", contains_questions: false, topics: [], chapters: [] }; }
   } catch (e) {
-    result = { category: "other", category_confidence: 0, summary: `Classification error: ${(e as Error).message}`.slice(0, 200), contains_questions: false, topics: [], chapters: [] };
+    const msg = (e as Error).message;
+    const transient = /429|529|rate_limit|overloaded|timed out|timeout|5\d\d/i.test(msg);
+    if (transient) {
+      // Rate-limited even after waiting. Do NOT instant-requeue (that caused a tick
+      // storm). Record it as classified-other with a marker; it can be repaired later
+      // via ?reclassify, and the run is allowed to finish so the user isn't blocked.
+      result = { category: "other", category_confidence: 0, summary: `Rate limited — re-classify later: ${msg}`.slice(0, 200), contains_questions: false, topics: [], chapters: [] };
+    } else {
+      result = { category: "other", category_confidence: 0, summary: `Classification error: ${msg}`.slice(0, 200), contains_questions: false, topics: [], chapters: [] };
+    }
   }
 
   const relevantChapters = (result as any).chapters?.filter((c: any) => c.relevant) ?? [];
@@ -1039,10 +1239,23 @@ async function tick(): Promise<{ worked: boolean }> {
   if (error) { console.error("claim error", error); return { worked: false }; }
   if (!job) return { worked: false };
 
+  // circuit breaker: a job that has been attempted too many times is retired so it can
+  // never drive an endless retry/tick loop (claim_onboarding_job increments attempts).
+  const MAX_ATTEMPTS = Number(Deno.env.get("JOB_MAX_ATTEMPTS") ?? "6");
+  if ((job.attempts ?? 0) > MAX_ATTEMPTS) {
+    await db.from("onboarding_jobs").update({ status: "failed" }).eq("id", job.id);
+    await logEvent(job.run_id, "warning", `Gave up on a ${job.stage} step after ${job.attempts} attempts`);
+    // try to let the run finish with whatever else is done
+    const { data: r } = await db.from("onboarding_runs").select("course_id").eq("id", job.run_id).single();
+    if (r) await maybeFinalize(job.run_id, r.course_id);
+    return { worked: false };
+  }
+
   try {
     if (job.stage === "extract") await doExtract(job);
     else if (job.stage === "read") await doRead(job);
     else if (job.stage === "ocr") await doOcr(job);
+    else if (job.stage === "textbook") await doTextbook(job);
     else if (job.stage === "understand") await doUnderstand(job);
     else if (job.stage === "spine") await doSpine(job);
     else if (job.stage === "assign") await doAssign(job);
@@ -1083,6 +1296,23 @@ Deno.serve(async (req) => {
       const bg = startBeatInBackground();
       if (!bg) await runBeat(); // local dev without EdgeRuntime
       return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, accepted: true, hint: "working in the background — watch the course activity feed; refresh to push again" }), { headers: { "Content-Type": "application/json" } });
+    }
+    const reCourse = url.searchParams.get("reclassify");
+    if (reCourse) {
+      // re-run understand for any doc that failed classification (e.g. a rate-limit error
+      // stored as category "other" with the error in its summary)
+      const { data: bad } = await db.from("source_files")
+        .select("id, run_id, original_path, summary, category")
+        .eq("course_id", reCourse).in("read_status", ["read", "partial"]);
+      const targets = (bad ?? []).filter((f: any) =>
+        (f.category === "other" || !f.category) && /error|rate.?limit|429|529|timed out/i.test(String(f.summary ?? "")));
+      for (const f of targets) {
+        await db.from("source_files").update({ summary: null, category: null }).eq("id", f.id);
+        await db.from("onboarding_jobs").insert({ run_id: f.run_id, stage: "understand", file_id: f.id });
+      }
+      const bg = startBeatInBackground();
+      if (!bg) await runBeat();
+      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, requeued: targets.map((t: any) => t.original_path) }), { headers: { "Content-Type": "application/json" } });
     }
     return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION }), { headers: { "Content-Type": "application/json" } });
   }
