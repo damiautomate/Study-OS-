@@ -1143,3 +1143,259 @@ textbook stage). Watch for "Scanning … for relevant chapters…" then "Reading
 p.A-B". Tunables: `TEXTBOOK_MAX_PAGES` (80), `TEXTBOOK_WINDOW` (8).
 
 Ping: `v16-textbook`.
+
+---
+
+## v17-drain (Path C) — no self-chaining, storm impossible, near-zero invocations
+
+**Why everything stalled despite a healthy v16:** Supabase Edge **invocations hit
+503% of the free-tier 500K/month** cap (from the storms), so Supabase throttled the
+function — a correct deploy simply wouldn't run. (Anthropic was fine: $14.87 credit
+left, only $3.72 spent — the storms burned cheap *requests*, not money.)
+
+**Path C — the permanent fix:**
+- The worker no longer invokes itself. `runBeat()` now **drains a batch** (up to
+  `DRAIN_MAX_JOBS`, default 40) in one invocation, looping internally until the queue
+  is empty or it nears the wall-clock budget (`DRAIN_BUDGET_MS`, default ~320s).
+- `fireNextTick` is **deleted** — there is no code path that calls the worker from
+  itself, so a tick storm is now structurally impossible.
+- The cron (one call/minute) drives it: **~43K invocations/month — under even the free
+  tier.** This class of problem cannot recur.
+
+Re-create the cron (safe SQL from the v13 notes). Ping: `v17-drain`.
+
+### Finish TODAY without waiting or upgrading — local-worker-runner.html
+Because Supabase only throttles invocations *it* hosts, you can drive the same worker
+from your own browser:
+1. Open `local-worker-runner.html` (double-click the file — it runs locally).
+2. Paste your worker URL and your `WORKER_SECRET` value.
+3. Click **Auto-run**. It calls your worker every few seconds; each call batch-drains
+   jobs. Watch the course Activity feed fill in; stop when the log shows the queue is
+   empty. (Secret stays in your browser; uses no cron and ~no hosted invocations since
+   the work runs when *you* call it.)
+
+This finishes the textbook + spine + questions + coverage now, on free tier.
+
+---
+
+## v18-cors — fixes "Failed to fetch" in the local runner
+
+**Cause:** the local-runner page POSTs cross-origin to the worker, but the worker sent
+no CORS headers, so the browser blocked the response ("Failed to fetch"). The GET ping
+worked because address-bar navigation isn't a cross-origin fetch.
+
+**Fix:** the worker now returns `Access-Control-Allow-Origin: *` (+ allowed methods/
+headers) on every response and answers the `OPTIONS` preflight. Verified locally:
+preflight returns the headers, POST carries them.
+
+**Instant unblock without redeploying** (works on any worker version): open
+`https://<project>.supabase.co/functions/v1/onboarding-worker?tick=1` in the address
+bar and refresh every few seconds — each load drains a batch (no CORS involved).
+
+After deploying v18, the local runner's **Auto-run** works as intended. Ping: `v18-cors`.
+
+---
+
+## v19-textbook2 — textbook ingestion that actually completes
+
+**Why v16's textbook path failed ("Couldn't open textbook"):** it made TWO calls that
+sent the entire 17MB scanned book to the model — one just to count pages, one to read
+the ToC. On the free Anthropic tier those huge calls hit the rate limit and failed, so
+the textbook was abandoned (the rest of the course finished fine).
+
+**v19 fixes the root cause — the model never receives the whole book:**
+- **Page count comes from the PDF bytes, not the AI:** a range-capped fetch reads the
+  PDF structure and counts pages (`/Count` + `/Type/Page`). Unit-tested on a real
+  37-page PDF → 37, zero tokens. If it still can't tell, it assumes a large book and
+  continues instead of failing.
+- **Chapter planning runs over OCR'd front matter only:** the first ~20 pages are OCR'd
+  by page-range (small, cheap), then the planner reads that TEXT — the 17MB document is
+  never sent to the planner.
+- **Chapter reading** stays as before: only the relevant chapters' page-ranges, OCR'd
+  by URL in ≤8-page windows, capped at `TEXTBOOK_MAX_PAGES` (80).
+- **No dead-ends:** if the ToC can't be matched, it reads a representative sample
+  instead of parking the file; a ToC-read failure re-queues for the next beat rather
+  than abandoning the textbook.
+
+**To re-run the textbook on your existing course:** after deploying v19, re-queue it:
+```sql
+update source_files set is_textbook = true, read_status = 'pending', page_count = null, chapter_plan = null
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+
+insert into onboarding_jobs (run_id, stage, file_id, chunk_index, status)
+select run_id, 'textbook', id, 0, 'queued' from source_files
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+```
+Then run the local runner (or `?tick=1`). Ping: `v19-textbook2`.
+
+---
+
+## v20-slice — THE textbook root cause: Anthropic's hard 100-page PDF limit
+
+**The real error, finally identified:** the 400 was
+`invalid_request_error: "A maximum of 100 PDF pages may be provided."` — a documented,
+hard Anthropic API limit (max 100 pages / 32MB per PDF request). Sending a `document`
+URL/base64 that points at the ~970-page solution manual is rejected **no matter which
+pages the prompt asks for** — the API loads the whole file and counts its pages. This
+is why every prior URL-based attempt failed at this exact step, while the <100-page
+scanned papers OCR'd fine.
+
+**The fix (the only one that works):** the worker now **slices the PDF itself** before
+sending. `sliceTextbookPages()` fetches the book, uses pdf-lib to extract just the
+requested page range into a small (<100-page, hard-capped) PDF, and sends THAT as
+base64. Applied to both the table-of-contents read and each chapter window. Proven with
+a real test: a 120-page PDF sliced to a valid 8-page, 2.3KB PDF.
+
+So the flow is now: count pages from bytes (no AI) → slice & OCR front matter → pick
+relevant chapters → slice & OCR each chapter window (≤8 pages, capped at 80 total) →
+understand → attach to topics. Nothing over 100 pages is ever sent.
+
+**Re-run on your course** (after deploying v20, confirm ping shows `v20-slice`):
+```sql
+update source_files set is_textbook = true, read_status = 'pending', page_count = null, chapter_plan = null, note = null
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+insert into onboarding_jobs (run_id, stage, file_id, chunk_index, status)
+select run_id, 'textbook', id, 0, 'queued' from source_files
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+```
+Then run the local runner / `?tick=1`.
+
+Note: slicing fetches the book per invocation, so textbook windows process one per beat
+(memory-safe). It's a bit slower but completes. Ping: `v20-slice`.
+
+---
+
+## v21-texttb — textbook done right: extract TEXT, pick chapters by content
+
+**Two things your screenshots + the actual file revealed:**
+1. The previous run hit the FALLBACK ("Sampled pages" 1–100) because the book has **no
+   table of contents** — page 1 is a copyright notice, page 2 is "Chapter 1, Problem 1".
+   So the ToC-based planner found nothing and sampled from the front = wrong chapters.
+2. The solution manual is **1,972 pages but fully TEXT (not scanned).** So OCR and the
+   100-page document API were never needed for it at all.
+
+**v21 detects this and does the right thing:**
+- Extracts the PDF **text** directly (unpdf) — free, no API, no page limit.
+- If the file is text (most are), finds chapter boundaries from the **"Chapter N"**
+  labels in the text (verified on your real book: all 19 chapters located with correct
+  page ranges).
+- Sends the AI a **boilerplate-stripped multi-page sample of each chapter** and asks
+  which chapter NUMBERS match the course. On your book this cleanly selects the EEG 322
+  chapters (sinusoids, AC analysis, AC power, transfer functions, Laplace, Laplace
+  circuits, Fourier series, Fourier transform) — not chapters 1–3.
+- Saves ONLY those chapters' text (capped at `TEXTBOOK_MAX_PAGES`, now 300) and runs it
+  through understand → topics, with page refs.
+- Scanned textbooks (no extractable text) still fall back to the v20 sliced-PDF OCR path.
+
+**Re-run on your course** (deploy v21, confirm ping `v21-texttb`):
+```sql
+update source_files set is_textbook = true, read_status = 'pending', page_count = null, chapter_plan = null, note = null, text_path = null
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+insert into onboarding_jobs (run_id, stage, file_id, chunk_index, status)
+select run_id, 'textbook', id, 0, 'queued' from source_files
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+```
+Then run the local runner / `?tick=1`. The textbook re-reads with the correct chapters.
+Ping: `v21-texttb`.
+
+---
+
+## v22-batchtb — textbook stuck in "Scanning…" loop: full-book parse was too heavy
+
+**Why v21 looped:** extracting text from the whole 1,972-page PDF in one beat took ~25s
+/ ~124MB+ — over the Edge Function budget — so the function died mid-parse every time,
+the job was reclaimed, and "Scanning… for relevant chapters" repeated forever.
+
+**v22 makes the textbook path batched + self-chaining (memory-safe):**
+- **Scan phase:** the book is parsed in `TB_SCAN_BATCH` (120) page slices per beat —
+  each beat slices a small PDF (pdf-lib) and extracts text (unpdf), accumulating
+  "Chapter N" start pages into `chapter_plan`, chaining to the next batch. Verified the
+  batched scan finds all 19 chapters of your real book, identical to a whole-book scan.
+- **Classify:** once scanned, samples each chapter (small slices) and asks which chapter
+  numbers match the course.
+- **Read phase:** reads only the chosen chapters, again in 120-page batches per beat,
+  appending text to storage, capped at `TEXTBOOK_MAX_PAGES` (300).
+- No beat ever loads the whole book; nothing over 100 pages is sent to any API. Scanned
+  textbooks still fall back to sliced-PDF OCR.
+
+Progress is now visible as "Scanning … X/1972 pages" then "Reading … Ch N p.A-B".
+
+**Re-run** (deploy v22, confirm ping `v22-batchtb`):
+```sql
+update source_files set is_textbook = true, read_status = 'pending', page_count = null, chapter_plan = null, note = null, text_path = null
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+insert into onboarding_jobs (run_id, stage, file_id, chunk_index, status)
+select run_id, 'textbook', id, 0, 'queued' from source_files
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+```
+Then run the local runner / `?tick=1`. Ping: `v22-batchtb`.
+
+---
+
+## v23-cache — textbook: extract ONCE to cache, then plan & read (no rework, no re-download)
+
+**Why v22 still failed (from your log):** the batched scan re-downloaded the whole 17MB
+book and re-sliced it EVERY beat — 16+ times. The end batches got slow, a couple of
+beats timed out, the per-job attempt counter hit 7, and the circuit breaker killed it at
+~1560/1972. The progress counter proved the approach worked; the re-download made it too
+slow to finish inside the attempt budget.
+
+**v23 fixes the root inefficiency — the book is parsed exactly once:**
+- **Phase "cache":** each beat downloads the book once, extracts a `TB_CACHE_BATCH`
+  (250) page slice, and APPENDS the page text to a cache file
+  (`tbcache/{run}/{file}.jsonl`). Progress is persisted, so a retry never redoes a
+  completed batch. ~8 beats for a 1,972-page book.
+- **Phase "plan":** loads the cache (cheap ~2MB read), finds chapter starts from
+  "Chapter N" labels, samples each chapter, asks which chapter numbers match the course.
+- **Phase "read":** copies ONLY the chosen chapters' text from the cache into the final
+  text file (capped `TEXTBOOK_MAX_PAGES`, 300), then deletes the cache.
+- Scanned books (little extractable text) fall back to OCR.
+
+**Validated twice before shipping:**
+1. Offline simulation against your REAL 1,972-page book: completes in **9 beats**,
+   slowest beat **3.6s**, finds all 19 chapters, selects the correct 8
+   (Ch 9,10,11,14,15,16,17,18 — sinusoids, AC analysis, AC power, transfer functions,
+   Laplace, Laplace circuits, Fourier series, Fourier transform), keeps 300 pages.
+2. Real-Deno test of the extract→cache→detect chain on a generated multi-chapter PDF:
+   correctly recovered `[1,2,9,15,17]` from cache. **PASS.**
+
+**Re-run** (deploy v23, confirm ping `v23-cache`):
+```sql
+update source_files set is_textbook = true, read_status = 'pending', page_count = null, chapter_plan = null, note = null, text_path = null
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+insert into onboarding_jobs (run_id, stage, file_id, chunk_index, status)
+select run_id, 'textbook', id, 0, 'queued' from source_files
+where course_id in (select id from courses where title = 'Circuits and Systems II')
+  and original_path ilike '%Fundamentals%';
+```
+Then run the local runner / `?tick=1`. You'll see "Reading … X/1972 pages" advance once,
+then "Read (textbook): … Ch 9, Ch 15, Ch 17…". Ping: `v23-cache`.
+
+---
+
+## v24-toc (cont.) — uploads survive leaving the new-course page
+
+**The real fix (not just a warning):** the new-course page used to upload files first and
+create the course only afterward — so leaving mid-upload lost everything. Now:
+1. The course + run are created FIRST (status "building") and appear in your list
+   immediately.
+2. Files upload into that already-existing course.
+3. Onboarding starts (`/api/courses/begin`) once uploads finish.
+
+So if you navigate away, the course is already saved — it shows as "building" in your
+courses list instead of disappearing. (New endpoint: `/api/courses/begin`; build shows
+19 routes.)
+
+Honest limit: the actual file *transfer* runs in your browser tab, so closing the tab
+mid-transfer still can't finish those bytes — but the course no longer vanishes, and a
+follow-up will add a "resume upload" affordance on the building-course page. Within-app
+navigation while the tab stays open is fully safe.

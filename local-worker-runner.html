@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Study OS — Local Worker Runner</title>
+<style>
+  :root { --bg:#fbf7f0; --ink:#211d16; --muted:#6e675b; --line:#e8dfd0; --gold:#e8501a; --sage:#3e7c4f; --rust:#b3261e; }
+  * { box-sizing:border-box; }
+  body { font-family:ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:24px; max-width:720px; margin-inline:auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 20px; font-size:14px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:.08em; }
+  input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:#fff; font-size:14px; font-family:ui-monospace,monospace; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:18px; flex-wrap:wrap; }
+  button { border:0; border-radius:999px; padding:10px 20px; font-size:14px; font-weight:600; cursor:pointer; }
+  #go { background:var(--gold); color:#fff; }
+  #stop { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:18px; font-size:13px; color:var(--muted); min-height:18px; }
+  #log { margin-top:14px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:12px 14px; height:300px; overflow:auto; font-family:ui-monospace,monospace; font-size:12px; line-height:1.7; }
+  .l-ok { color:var(--sage); } .l-err { color:var(--rust); } .l-info { color:var(--muted); }
+  .note { background:#fff; border:1px solid var(--line); border-left:3px solid var(--gold); border-radius:8px; padding:10px 14px; font-size:13px; color:var(--muted); margin-top:18px; line-height:1.6; }
+  code { background:#f3ede2; padding:1px 5px; border-radius:5px; }
+</style>
+</head>
+<body>
+  <h1>Study OS — Local Worker Runner 🔥</h1>
+  <p class="sub">Finishes onboarding from your own browser, with no Supabase cron and (almost) no hosted invocations. Each click of <b>Run one step</b> processes a small batch; <b>Auto-run</b> keeps going until the queue is empty.</p>
+
+  <label for="url">Worker URL</label>
+  <input id="url" placeholder="https://YOUR-PROJECT.supabase.co/functions/v1/onboarding-worker" />
+  <label for="secret">Worker secret (the value of WORKER_SECRET)</label>
+  <input id="secret" type="password" placeholder="paste your worker secret" />
+
+  <div class="row">
+    <button id="go">Run one step</button>
+    <button id="auto">Auto-run</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="log"></div>
+
+  <div class="note">
+    This calls your worker the same way the cron would, but from here — so it isn't
+    blocked by Supabase's hosted invocation cap. It runs one batch every few seconds.
+    Watch your course's Activity feed fill in. When the log says <code>queue empty</code>
+    a few times in a row, onboarding is done — you can close this tab.
+    Your secret never leaves your browser.
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const log = (msg, cls="l-info") => {
+    const d = document.createElement("div");
+    d.className = cls; d.textContent = new Date().toLocaleTimeString() + "  " + msg;
+    $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
+  };
+  // persist url so you don't retype it (secret is NOT stored)
+  try { const u = localStorage.getItem("sos_worker_url"); if (u) $("url").value = u; } catch {}
+
+  let running = false, emptyStreak = 0;
+
+  async function step() {
+    const url = $("url").value.trim().replace(/\/+$/,"");
+    const secret = $("secret").value;
+    if (!url || !secret) { log("Enter the worker URL and secret first.", "l-err"); return false; }
+    try { localStorage.setItem("sos_worker_url", url); } catch {}
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-worker-secret": secret },
+        body: "{}",
+      });
+      if (res.status === 403) { log("403 — wrong secret. Check WORKER_SECRET.", "l-err"); return false; }
+      if (!res.ok) { log("Worker returned HTTP " + res.status, "l-err"); return true; }
+      const j = await res.json().catch(() => ({}));
+      log("beat ok " + JSON.stringify(j), "l-ok");
+      return true;
+    } catch (e) {
+      log("network error: " + e.message + " (is the URL right?)", "l-err");
+      return false;
+    }
+  }
+
+  $("go").onclick = async () => { $("go").disabled = true; await step(); $("go").disabled = false; };
+
+  $("auto").onclick = async () => {
+    if (running) return;
+    running = true; emptyStreak = 0;
+    $("auto").disabled = true; $("go").disabled = true; $("stop").disabled = false;
+    $("status").textContent = "Auto-running… processing the queue.";
+    log("auto-run started", "l-info");
+    while (running) {
+      const ok = await step();
+      if (!ok) break;
+      // we can't see job counts here, so we just keep pumping batches every 4s;
+      // the worker's batch-drain does the heavy lifting per call.
+      await new Promise(r => setTimeout(r, 4000));
+    }
+    running = false;
+    $("auto").disabled = false; $("go").disabled = false; $("stop").disabled = true;
+    $("status").textContent = "Stopped.";
+    log("auto-run stopped", "l-info");
+  };
+
+  $("stop").onclick = () => { running = false; };
+</script>
+</body>
+</html>

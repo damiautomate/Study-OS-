@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { ensureSession } from "@/lib/supabase/client";
 import { describeWindows } from "@/lib/semester";
@@ -19,6 +19,16 @@ export default function NewCourse() {
   const [semesterStart, setSemesterStart] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+
+  // Guard against losing an in-progress upload: if the user tries to close/navigate
+  // away while uploading, the browser asks them to confirm. (The upload is held in this
+  // page's state until the course is created, so leaving mid-upload would discard it.)
+  useEffect(() => {
+    if (!busy) return;
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [busy]);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
 
@@ -40,6 +50,20 @@ export default function NewCourse() {
         const sizeErr = checkFileSize(f);
         if (sizeErr) throw new Error(sizeErr);
       }
+
+      // 1) Create the course FIRST (status building) so it persists in the user's list
+      //    even if they navigate away during the upload.
+      setStatus("Creating your course…");
+      const createRes = await fetch("/api/courses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title.trim(), code: code.trim(), semesterStart, awaitingUpload: true }),
+      });
+      const created = await createRes.json();
+      if (!createRes.ok) throw new Error(typeof created.error === "string" ? created.error : JSON.stringify(created.error ?? "Could not create the course."));
+      const { courseId, runId } = created;
+
+      // 2) Upload the files into that course.
       const batch = crypto.randomUUID();
       const uploaded: { path: string; name: string; size: number; mime: string | null }[] = [];
       for (let i = 0; i < files.length; i++) {
@@ -52,16 +76,17 @@ export default function NewCourse() {
         uploaded.push({ path, name: f.name, size: f.size, mime: f.type || null });
       }
 
-      setStatus("Setting things up…");
-      const res = await fetch("/api/courses", {
+      // 3) Files are up — start onboarding.
+      setStatus("Starting onboarding…");
+      const beginRes = await fetch("/api/courses/begin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title.trim(), code: code.trim(), semesterStart, uploadPaths: uploaded }),
+        body: JSON.stringify({ runId, uploadPaths: uploaded }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(typeof json.error === "string" ? json.error : JSON.stringify(json.error ?? "Something went wrong."));
+      const begun = await beginRes.json();
+      if (!beginRes.ok) throw new Error(typeof begun.error === "string" ? begun.error : JSON.stringify(begun.error ?? "Could not start onboarding."));
 
-      router.push(`/courses/${json.courseId}`);
+      router.push(`/courses/${courseId}`);
     } catch (e) {
       setError(errMsg(e));
       setBusy(false);

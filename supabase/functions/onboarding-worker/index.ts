@@ -33,7 +33,7 @@ const OCR_MAX_TOKENS = 16000;
 const UNDERSTAND_MAX_TOKENS = 2000;
 const MAX_UNDERSTAND_CHARS = Number(Deno.env.get("MAX_UNDERSTAND_CHARS") ?? "20000");
 
-const WORKER_VERSION = "v16-textbook";
+const WORKER_VERSION = "v24-toc";
 // Edge functions get ~2s CPU / 256MB — never load big files into memory.
 const MAX_FILE_MB = Number(Deno.env.get("MAX_FILE_MB") ?? "25");
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
@@ -100,23 +100,9 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
-// Single-flight chaining: at most ONE next-tick in flight per invocation. Combined
-// with chaining only from runBeat(), this makes a tick storm structurally impossible.
-let _chained = false;
-function fireNextTick() {
-  if (_chained) return;
-  _chained = true;
-  try {
-    // @ts-ignore EdgeRuntime provided by Supabase
-    EdgeRuntime.waitUntil(
-      fetch(`${SUPABASE_URL}/functions/v1/onboarding-worker`, {
-        method: "POST",
-        headers: { "x-worker-secret": WORKER_SECRET, "Authorization": `Bearer ${SERVICE_KEY}`, "Content-Type": "application/json" },
-        body: "{}",
-      }).catch(() => {}),
-    );
-  } catch (_) { /* no-op */ }
-}
+// (self-invocation removed in Path C — the cron drives one batch-draining beat per
+// minute; there is no code path that invokes the worker from itself.)
+
 
 async function enqueueUnderstand(runId: string, fileId: string) {
   await db.from("onboarding_jobs").insert({ run_id: runId, stage: "understand", file_id: fileId });
@@ -570,21 +556,54 @@ async function doRead(job: any) {
 // 1..N OCR each planned window by URL; then stitch + understand.
 const TEXTBOOK_WINDOW = Number(Deno.env.get("TEXTBOOK_WINDOW") ?? "8"); // pages per OCR call
 
+// Fetch the whole book ONCE per invocation and slice out a small page-range PDF as
+// base64. Sending sliced PDFs (<100 pages) is the ONLY way past Anthropic's hard
+// "max 100 PDF pages" 400 error — a URL/document to a 900-page book is always rejected.
+async function sliceTextbookPages(fileUrl: string, start: number, end: number): Promise<{ b64: string; count: number } | null> {
+  try {
+    const res = await fetch(fileUrl);
+    if (!res.ok) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const { PDFDocument } = await import("npm:pdf-lib@1.17.1");
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const total = src.getPageCount();
+    const a = Math.max(1, Math.min(start, total));
+    const b = Math.max(a, Math.min(end, total, a + 99)); // never exceed 100 pages
+    const out = await PDFDocument.create();
+    const idxs = Array.from({ length: b - a + 1 }, (_, i) => a - 1 + i);
+    const copied = await out.copyPages(src, idxs);
+    copied.forEach((p) => out.addPage(p));
+    const sliced = await out.save();
+    // base64 without blowing the stack on large arrays
+    let bin = ""; const CH = 0x8000;
+    for (let i = 0; i < sliced.length; i += CH) bin += String.fromCharCode(...sliced.subarray(i, i + CH));
+    return { b64: btoa(bin), count: idxs.length };
+  } catch (_) { return null; }
+}
+
+
 // Ask Claude how many pages the PDF has, by URL (no download).
+// Page count WITHOUT sending the book to the AI. We fetch the raw PDF bytes (range-
+// capped) and count page objects from the PDF structure. Robust to scanned books.
 async function pdfPageCountByUrl(fileUrl: string): Promise<number | null> {
   try {
-    const { text } = await callClaude(OCR_MODEL, [
-      { type: "document", source: { type: "url", url: fileUrl } },
-      { type: "text", text: 'How many pages does this PDF have in total? Reply with ONLY the integer, nothing else.' },
-    ], 20);
-    const n = parseInt(String(text).replace(/[^0-9]/g, ""), 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    // pull up to ~12MB; page-tree /Count and /Type/Page markers live throughout the file
+    const res = await fetch(fileUrl, { headers: { Range: "bytes=0-12000000" } });
+    if (!res.ok && res.status !== 206) return null;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const text = new TextDecoder("latin1").decode(buf);
+    // Prefer the catalog's /Count (total pages); else count /Type/Page occurrences.
+    let best: number | null = null;
+    const counts = [...text.matchAll(/\/Count\s+(\d+)/g)].map((m) => parseInt(m[1], 10)).filter((n) => Number.isFinite(n));
+    if (counts.length) best = Math.max(...counts);
+    const pageMarks = (text.match(/\/Type\s*\/Page[^s]/g) || []).length;
+    if (pageMarks > 0) best = Math.max(best ?? 0, pageMarks);
+    return best && best > 0 ? best : null;
   } catch (_) { return null; }
 }
 
 async function doTextbook(job: any) {
   const runId = job.run_id;
-  const chunk = job.chunk_index ?? 0;
   const { data: file } = await db.from("source_files").select("*").eq("id", job.file_id).single();
   if (!file) { await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id); return; }
   const label = file.original_path.split("/").pop();
@@ -593,126 +612,255 @@ async function doTextbook(job: any) {
   if (!su?.signedUrl) throw new Error("textbook file missing in storage");
   const fileUrl = su.signedUrl;
 
-  // ----- chunk 0: build the chapter plan -----
-  if (chunk === 0) {
-    await logEvent(runId, "stage", `Scanning ${label} for relevant chapters…`);
-    const pages = (typeof file.page_count === "number" && file.page_count > 0)
-      ? file.page_count : await pdfPageCountByUrl(fileUrl);
-    if (!pages) {
-      await db.from("source_files").update({ read_status: "unsupported", note: "could not read textbook page count" }).eq("id", file.id);
+  const CACHE_BATCH = Number(Deno.env.get("TB_CACHE_BATCH") ?? "250"); // pages cached per beat
+  const MAX_TB_PAGES = Number(Deno.env.get("TEXTBOOK_MAX_PAGES") ?? "300");
+  const cachePath = `tbcache/${runId}/${file.id}.jsonl`; // one JSON line per page: {p, t}
+  const textPath = `text/${runId}/${file.id}.txt`;
+  const SEP = "\n\u0001\n";
+
+  // Extract text for a page range by slicing a small PDF and running unpdf on the slice.
+  async function extractRangeText(bytes: Uint8Array, start: number, end: number): Promise<string[]> {
+    const { PDFDocument } = await import("npm:pdf-lib@1.17.1");
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const tot = src.getPageCount();
+    const a = Math.max(1, start), b = Math.min(end, tot);
+    if (b < a) return [];
+    const out = await PDFDocument.create();
+    const idxs = Array.from({ length: b - a + 1 }, (_, i) => a - 1 + i);
+    const copied = await out.copyPages(src, idxs);
+    copied.forEach((p) => out.addPage(p));
+    const sliced = await out.save();
+    const { getDocumentProxy, extractText } = await import("npm:unpdf@0.12.1");
+    const pdf = await getDocumentProxy(sliced);
+    const { text } = await extractText(pdf, { mergePages: false });
+    return Array.isArray(text) ? text : [String(text ?? "")];
+  }
+  async function readCache(): Promise<string> {
+    try { const dl = await db.storage.from(BUCKET).download(cachePath); if (!dl.error && dl.data) return await dl.data.text(); } catch (_) { /* */ }
+    return "";
+  }
+
+  const plan = (file.chapter_plan as any) || { phase: "cache", cursor: 0 };
+
+  // ---------- phase: cache (extract text once, in batches, append to cache) ----------
+  if (plan.phase === "cache") {
+    if (!plan.cursor) await logEvent(runId, "stage", `Reading ${label} (text)…`);
+    let total = (typeof file.page_count === "number" && file.page_count > 0) ? file.page_count : null;
+    // fetch the book ONCE this beat
+    const res = await fetch(fileUrl);
+    if (!res.ok) throw new Error(`fetch failed ${res.status}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (!total) {
+      const { PDFDocument } = await import("npm:pdf-lib@1.17.1");
+      const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      total = doc.getPageCount();
+      await db.from("source_files").update({ page_count: total }).eq("id", file.id);
+    }
+    const from = (plan.cursor ?? 0) + 1;
+    const to = Math.min(from + CACHE_BATCH - 1, total);
+    const slice = await extractRangeText(bytes, from, to);
+    // append lines to cache
+    let lines = "";
+    for (let i = 0; i < slice.length; i++) lines += JSON.stringify({ p: from + i, t: (slice[i] || "") }) + "\n";
+    const prior = await readCache();
+    await db.storage.from(BUCKET).upload(cachePath, new TextEncoder().encode(prior + lines), { contentType: "application/x-ndjson", upsert: true });
+
+    if (to < total) {
+      await db.from("source_files").update({ chapter_plan: { phase: "cache", cursor: to } }).eq("id", file.id);
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 0 });
       await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-      await logEvent(runId, "warning", `Couldn't open textbook: ${label}`);
+      await logEvent(runId, "info", `Reading ${label}… ${to}/${total} pages`);
       await maybeFinalize(runId, file.course_id);
       return;
     }
-    await db.from("source_files").update({ page_count: pages }).eq("id", file.id);
+    // cache complete -> plan phase
+    await db.from("source_files").update({ chapter_plan: { phase: "plan" }, page_count: total }).eq("id", file.id);
+    await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 0 });
+    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+    await logEvent(runId, "info", `Read ${total} pages of ${label}; selecting chapters…`);
+    await maybeFinalize(runId, file.course_id);
+    return;
+  }
 
-    // read the FRONT MATTER (table of contents) only — first up to 25 pages — by URL
-    const { data: crs } = await db.from("courses").select("title").eq("id", file.course_id).single();
-    const tocEnd = Math.min(25, pages);
-    const planPrompt =
-      `This is the front matter of a textbook. The course is "${crs?.title ?? "this course"}". ` +
-      `From the table of contents on pages 1-${tocEnd}, identify the chapters whose topics are relevant to this course. ` +
-      `Use the printed page ranges from the ToC. Return ONLY JSON, no fences: ` +
-      `{"chapters":[{"title":"...","pages":"START-END","relevant":true|false}]} — include the page range for each relevant chapter. ` +
-      `Be selective: a typical course uses 2-5 chapters of a big textbook, not all of it.`;
-    let chapters: any[] = [];
-    try {
-      const { text, usage } = await callClaude(SPINE_MODEL, [
-        { type: "document", source: { type: "url", url: fileUrl } },
-        { type: "text", text: planPrompt },
-      ], 2000);
-      await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "understand", model: SPINE_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
-      const parsed = parseUnderstanding(text);
-      chapters = Array.isArray(parsed?.chapters) ? parsed.chapters : [];
-    } catch (_) { chapters = []; }
+  // load cached page texts (used by plan + read)
+  async function loadPages(): Promise<Map<number, string>> {
+    const raw = await readCache();
+    const m = new Map<number, string>();
+    for (const ln of raw.split("\n")) { if (!ln.trim()) continue; try { const o = JSON.parse(ln); if (typeof o.p === "number") m.set(o.p, o.t || ""); } catch (_) { /* */ } }
+    return m;
+  }
+  const total = (typeof file.page_count === "number" && file.page_count > 0) ? file.page_count : 0;
 
-    // turn relevant chapters into capped, in-range OCR windows
-    const parseRange = (sp: string): [number, number] | null => {
-      const m = String(sp).match(/(\d+)\s*-\s*(\d+)/);
-      if (!m) return null;
-      let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
-      if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-      a = Math.max(1, Math.min(a, pages)); b = Math.max(1, Math.min(b, pages));
-      return a <= b ? [a, b] : null;
-    };
-    const relevant = chapters.filter((c: any) => c?.relevant && c?.pages);
-    const MAX_TB_PAGES = Number(Deno.env.get("TEXTBOOK_MAX_PAGES") ?? "80");
-    const windows: { title: string; start: number; end: number }[] = [];
-    let budget = MAX_TB_PAGES;
-    for (const c of relevant) {
-      const r = parseRange(c.pages);
-      if (!r) continue;
-      for (let p = r[0]; p <= r[1] && budget > 0; p += TEXTBOOK_WINDOW) {
-        const end = Math.min(p + TEXTBOOK_WINDOW - 1, r[1], p + budget - 1);
-        windows.push({ title: String(c.title ?? "Chapter").slice(0, 120), start: p, end });
-        budget -= (end - p + 1);
+  // ---------- phase: plan (find chapters from cache, classify) ----------
+  if (plan.phase === "plan") {
+    const pagesMap = await loadPages();
+    // detect if this is a real text PDF
+    let nonEmpty = 0; for (const t of pagesMap.values()) if ((t || "").trim().length > 40) nonEmpty++;
+    const isText = total > 0 && nonEmpty / total > 0.3;
+    if (!isText) {
+      // scanned book: fall back to OCR path by switching plan to the legacy scanned flow
+      await db.from("source_files").update({ chapter_plan: null }).eq("id", file.id);
+      await logEvent(runId, "info", `${label}: not enough text — using OCR`);
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 0 });
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      // mark as scanned so chunk0 takes OCR branch next time
+      await db.from("source_files").update({ note: "__ocr__" }).eq("id", file.id);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
+    // ===== ToC-first path: if the book has a real table of contents, use it =====
+    // Parse the contents pages for "Chapter N Title ... printedPage", then locate each
+    // chapter's REAL opening page by title (printed!=physical, and the offset drifts, so
+    // we search rather than do arithmetic). This avoids scanning the whole book.
+    const tocChapters = (() => {
+      let toc = "";
+      for (let p = 1; p <= Math.min(25, total); p++) toc += " " + (pagesMap.get(p) || "");
+      toc = toc.replace(/\s+/g, " ");
+      const out: { num: number; title: string }[] = [];
+      const seen = new Set<number>();
+      for (const m of toc.matchAll(/Chapter\s+(\d+)\s+([A-Za-z][A-Za-z \-'&]+?)\s+\d{1,4}\b/g)) {
+        const num = parseInt(m[1], 10);
+        if (Number.isFinite(num) && !seen.has(num)) { seen.add(num); out.push({ num, title: m[2].trim() }); }
+      }
+      return out.sort((a, b) => a.num - b.num);
+    })();
+
+    if (tocChapters.length >= 3) {
+      // locate real opening page per chapter, monotonically (in chapter order)
+      const frontEnd = Math.min(25, total);
+      const openings = new Map<number, number>();
+      let cursor = frontEnd + 1;
+      for (const ch of tocChapters) {
+        const w0 = (ch.title.split(/\s+/)[0] || "").toLowerCase();
+        for (let p = cursor; p <= total; p++) {
+          const head = (pagesMap.get(p) || "").slice(0, 320).replace(/\s+/g, " ");
+          if (new RegExp(`\\bChapter\\s+${ch.num}\\b`).test(head) && (w0.length < 3 || head.toLowerCase().includes(w0))) {
+            openings.set(ch.num, p); cursor = p; break;
+          }
+        }
+      }
+      const located = tocChapters.filter((c) => openings.has(c.num));
+      if (located.length >= 3) {
+        const nums = located.map((c) => c.num);
+        const ranges = located.map((c, i) => ({
+          num: c.num, title: c.title, start: openings.get(c.num)!,
+          end: i + 1 < located.length ? openings.get(located[i + 1].num)! - 1 : total,
+        }));
+        // classify by TITLE (cheap — no need to sample body text; the ToC titles are descriptive)
+        const { data: crs } = await db.from("courses").select("title").eq("id", file.course_id).single();
+        const titleList = ranges.map((c) => `Chapter ${c.num}: ${c.title}`).join("\n");
+        const planPrompt =
+          `A textbook has these chapters. The course is "${crs?.title ?? "this course"}". ` +
+          `Pick ONLY the chapter numbers whose topics are relevant to this course. Be selective (typically 3-7 chapters). ` +
+          `Return ONLY JSON, no fences: {"relevant_chapters":[numbers]}.\n\n` + titleList;
+        let relevantNums: number[] = [];
+        try {
+          const { text: out, usage } = await callClaude(SPINE_MODEL, [{ type: "text", text: planPrompt }], 400);
+          await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "understand", model: SPINE_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+          const parsed = JSON.parse(out.replace(/```json|```/g, "").trim());
+          relevantNums = Array.isArray(parsed?.relevant_chapters) ? parsed.relevant_chapters.map((x: any) => parseInt(x, 10)).filter(Number.isFinite) : [];
+        } catch (_) { relevantNums = []; }
+        const chosen = ranges.filter((c) => relevantNums.includes(c.num)).slice(0, 8);
+        if (chosen.length > 0) {
+          await db.from("source_files").update({
+            chapter_plan: { phase: "read", chosen, ci: 0, cursor: chosen[0].start, kept: 0 },
+            page_map: chosen.map((c) => ({ title: `Chapter ${c.num} ${c.title}`, pages: `${c.start}-${c.end}` })),
+          }).eq("id", file.id);
+          await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 1 });
+          await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+          await logEvent(runId, "stage", `Found contents — reading ${chosen.length} relevant chapters of ${label}: ${chosen.map((c) => "Ch " + c.num).join(", ")}`);
+          await maybeFinalize(runId, file.course_id);
+          return;
+        }
+        // ToC found but nothing matched -> fall through to scan as a safety net
       }
     }
+    // ===== end ToC-first path; fall back to "Chapter N" scan below =====
 
-    if (windows.length === 0) {
-      // no relevant chapters found — leave it parked rather than reading the whole book
-      await db.from("source_files").update({
-        read_status: "unsupported",
-        page_map: chapters.length ? chapters : null,
-        note: "no chapters matched this course — open it manually from the library, or split the relevant chapters into their own PDF",
-      }).eq("id", file.id);
+    // chapter starts (fallback for books without a parseable ToC)
+    const chapFirst = new Map<number, number>();
+    for (let p = 1; p <= total; p++) {
+      const t = pagesMap.get(p) || "";
+      for (const m of t.matchAll(/Chapter\s+(\d+)\b/gi)) { const c = parseInt(m[1], 10); if (Number.isFinite(c) && !chapFirst.has(c)) chapFirst.set(c, p); }
+    }
+    const starts = [...chapFirst.entries()].sort((a, b) => a[0] - b[0]);
+    if (starts.length < 2) {
+      // no chapter structure -> keep a capped sample so it still contributes
+      const chosen = [{ num: 0, start: 1, end: Math.min(MAX_TB_PAGES, total) }];
+      await db.from("source_files").update({ chapter_plan: { phase: "read", chosen, ci: 0, cursor: 1, kept: 0 } }).eq("id", file.id);
+      await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 1 });
       await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-      await logEvent(runId, "info", `${label}: no chapters matched this course — skipped (nothing irrelevant was read)`);
+      await logEvent(runId, "info", `${label}: no chapter markers — keeping first ${Math.min(MAX_TB_PAGES, total)} pages`);
       await maybeFinalize(runId, file.course_id);
       return;
     }
-
+    const ranges = starts.map(([num, start], idx) => ({ num, start, end: idx + 1 < starts.length ? starts[idx + 1][1] - 1 : total }));
+    const { data: crs } = await db.from("courses").select("title").eq("id", file.course_id).single();
+    const stripBoiler = (s: string) => s.replace(/PROPRIETARY MATERIAL[\s\S]*?(?=Chapter|$)/g, " ");
+    const samples = ranges.map((c) => {
+      let buf = "";
+      for (let p = c.start; p <= Math.min(c.start + 3, c.end); p++) buf += " " + stripBoiler(pagesMap.get(p) || "");
+      return `Chapter ${c.num} (p.${c.start}-${c.end}): ${buf.replace(/\s+/g, " ").trim().slice(0, 300)}`;
+    }).join("\n\n");
+    const planPrompt =
+      `A solution manual has these chapters (with a text sample of each). The course is "${crs?.title ?? "this course"}". ` +
+      `Pick ONLY the chapter numbers whose topics are relevant to this course. Be selective (typically 2-6 chapters). ` +
+      `Return ONLY JSON, no fences: {"relevant_chapters":[numbers]}.\n\n` + samples.slice(0, 14000);
+    let relevantNums: number[] = [];
+    try {
+      const { text: out, usage } = await callClaude(SPINE_MODEL, [{ type: "text", text: planPrompt }], 600);
+      await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "understand", model: SPINE_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
+      const parsed = JSON.parse(out.replace(/```json|```/g, "").trim());
+      relevantNums = Array.isArray(parsed?.relevant_chapters) ? parsed.relevant_chapters.map((n: any) => parseInt(n, 10)).filter(Number.isFinite) : [];
+    } catch (_) { relevantNums = []; }
+    let chosen = ranges.filter((c) => relevantNums.includes(c.num)).slice(0, 8);
+    if (chosen.length === 0) {
+      await db.from("source_files").update({ read_status: "read", text_path: null, chapter_plan: null, note: "textbook: no chapters matched this course" }).eq("id", file.id);
+      await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
+      await logEvent(runId, "info", `${label}: no chapters matched this course`);
+      await maybeFinalize(runId, file.course_id);
+      return;
+    }
     await db.from("source_files").update({
-      chapter_plan: { windows, done: 0 },
-      page_map: relevant.length ? relevant : null,
-      note: `using: ${relevant.map((c: any) => `${c.title} (p.${c.pages})`).join("; ").slice(0, 280)}`,
+      chapter_plan: { phase: "read", chosen, ci: 0, cursor: chosen[0].start, kept: 0 },
+      page_map: chosen.map((c) => ({ title: `Chapter ${c.num}`, pages: `${c.start}-${c.end}` })),
     }).eq("id", file.id);
     await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: 1 });
     await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-    const totalPages = windows.reduce((s, w) => s + (w.end - w.start + 1), 0);
-    await logEvent(runId, "stage", `Reading ${relevant.length} relevant chapter${relevant.length === 1 ? "" : "s"} of ${label} (${totalPages} pages)…`);
+    await logEvent(runId, "stage", `Reading ${chosen.length} relevant chapters of ${label}: ${chosen.map((c) => "Ch " + c.num).join(", ")}`);
     await maybeFinalize(runId, file.course_id);
     return;
   }
 
-  // ----- chunks 1..N: OCR one planned window by URL -----
-  const plan = file.chapter_plan as { windows: { title: string; start: number; end: number }[]; done: number } | null;
-  if (!plan || !Array.isArray(plan.windows)) {
-    await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-    await maybeFinalize(runId, file.course_id);
-    return;
-  }
-  const wIdx = chunk - 1;
-  if (wIdx >= plan.windows.length) {
-    // finished all windows: stitch saved text, mark read, understand
-    const textPath = `text/${runId}/${file.id}.txt`;
-    await db.from("source_files").update({ read_status: "read", text_path: textPath, page_count: file.page_count }).eq("id", file.id);
+  // ---------- phase: read (copy chosen chapters from cache to final text) ----------
+  if (plan.phase === "read" && Array.isArray(plan.chosen)) {
+    const pagesMap = await loadPages();
+    const chosen = plan.chosen as { num: number; start: number; end: number }[];
+    let kept = plan.kept ?? 0;
+    let out = "";
+    for (const c of chosen) {
+      out += `\n[[CHAPTER ${c.num}]]\n`;
+      for (let p = c.start; p <= c.end && kept < MAX_TB_PAGES; p++) { out += `[[PAGE ${p}]]\n` + (pagesMap.get(p) || "").trim() + "\n"; kept++; }
+      if (kept >= MAX_TB_PAGES) break;
+    }
+    await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(out.trim()), { contentType: "text/plain", upsert: true });
+    await db.from("source_files").update({
+      read_status: "read", text_path: textPath,
+      note: `using: ${chosen.map((c) => `Chapter ${c.num} (p.${c.start}-${c.end})`).join("; ").slice(0, 280)}`,
+      chapter_plan: null,
+    }).eq("id", file.id);
     await enqueueUnderstand(runId, file.id);
+    // cleanup cache
+    try { await db.storage.from(BUCKET).remove([cachePath]); } catch (_) { /* */ }
     await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-    await logEvent(runId, "success", `Read (textbook, relevant chapters): ${label}`);
+    await logEvent(runId, "success", `Read (textbook): ${chosen.length} relevant chapters of ${label} — ${chosen.map((c) => "Ch " + c.num).join(", ")}`);
     await maybeFinalize(runId, file.course_id);
     return;
   }
 
-  const w = plan.windows[wIdx];
-  const textPath = `text/${runId}/${file.id}.txt`;
-  const { text, usage } = await callClaude(OCR_MODEL, [
-    { type: "document", source: { type: "url", url: fileUrl } },
-    { type: "text", text: OCR_PROMPT.replace("{FIRST_PAGE}", String(w.start)).replace("{LAST_PAGE}", String(w.end)) },
-  ], OCR_MAX_TOKENS);
-  await db.from("ai_usage").insert({ run_id: runId, file_id: file.id, stage: "ocr", model: OCR_MODEL, input_tokens: usage.input_tokens, output_tokens: usage.output_tokens });
-
-  // append to the accumulating text file
-  let prior = "";
-  try { const dl = await db.storage.from(BUCKET).download(textPath); if (!dl.error && dl.data) prior = await dl.data.text(); } catch (_) { /* first window */ }
-  const merged = prior + (prior ? "\n\n" : "") + `[[CHAPTER ${w.title}]]\n` + text;
-  await db.storage.from(BUCKET).upload(textPath, new TextEncoder().encode(merged), { contentType: "text/plain", upsert: true });
-
-  await db.from("source_files").update({ chapter_plan: { windows: plan.windows, done: wIdx + 1 } }).eq("id", file.id);
-  await db.from("onboarding_jobs").insert({ run_id: runId, stage: "textbook", file_id: file.id, chunk_index: chunk + 1 });
+  // unknown plan state -> reset
+  await db.from("source_files").update({ chapter_plan: { phase: "cache", cursor: 0 } }).eq("id", file.id);
   await db.from("onboarding_jobs").update({ status: "done" }).eq("id", job.id);
-  await logEvent(runId, "info", `Reading ${label}: ${w.title} p.${w.start}-${w.end} (${wIdx + 1}/${plan.windows.length})`);
   await maybeFinalize(runId, file.course_id);
 }
 
@@ -1269,10 +1417,21 @@ async function tick(): Promise<{ worked: boolean }> {
 }
 
 // One beat: claim + process one job, chain the next if anything was done.
+// Path C: drain a BATCH of jobs per invocation, looping internally, instead of each
+// job spawning a new invocation. One cron call per minute now does many jobs, so total
+// invocations are ~1/min (≈43K/month — under even the free tier). No self-chain = no
+// storm possible. Stops early to stay within the background-task wall-clock budget.
+const DRAIN_MAX_JOBS = Number(Deno.env.get("DRAIN_MAX_JOBS") ?? "40");
+const DRAIN_BUDGET_MS = Number(Deno.env.get("DRAIN_BUDGET_MS") ?? "320000"); // ~320s of ~400s
+
 async function runBeat() {
+  const startedAt = Date.now();
   try {
-    const { worked } = await tick();
-    if (worked) fireNextTick();
+    for (let i = 0; i < DRAIN_MAX_JOBS; i++) {
+      if (Date.now() - startedAt > DRAIN_BUDGET_MS) break; // leave headroom; cron picks up the rest
+      const { worked } = await tick();
+      if (!worked) break; // queue empty (or a retired job) — done for now
+    }
   } catch (_) { /* job-level failures are recorded by the stages themselves */ }
 }
 
@@ -1289,13 +1448,23 @@ function startBeatInBackground(): boolean {
   }
 }
 
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-worker-secret, content-type, apikey",
+};
+const jsonHeaders = { "Content-Type": "application/json", ...CORS };
+
 Deno.serve(async (req) => {
+  // CORS preflight (the browser sends OPTIONS before a cross-origin POST)
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
+
   if (req.method === "GET") {
     const url = new URL(req.url);
     if (url.searchParams.get("tick") === "1") {
       const bg = startBeatInBackground();
       if (!bg) await runBeat(); // local dev without EdgeRuntime
-      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, accepted: true, hint: "working in the background — watch the course activity feed; refresh to push again" }), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, accepted: true, hint: "working in the background — watch the course activity feed; refresh to push again" }), { headers: jsonHeaders });
     }
     const reCourse = url.searchParams.get("reclassify");
     if (reCourse) {
@@ -1312,12 +1481,12 @@ Deno.serve(async (req) => {
       }
       const bg = startBeatInBackground();
       if (!bg) await runBeat();
-      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, requeued: targets.map((t: any) => t.original_path) }), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION, requeued: targets.map((t: any) => t.original_path) }), { headers: jsonHeaders });
     }
-    return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION }), { headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: true, worker: WORKER_VERSION }), { headers: jsonHeaders });
   }
-  if (req.headers.get("x-worker-secret") !== WORKER_SECRET) return new Response("forbidden", { status: 403 });
+  if (req.headers.get("x-worker-secret") !== WORKER_SECRET) return new Response("forbidden", { status: 403, headers: CORS });
   const bg = startBeatInBackground();
   if (!bg) await runBeat();
-  return new Response(JSON.stringify({ accepted: true }), { headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ accepted: true }), { headers: jsonHeaders });
 });
